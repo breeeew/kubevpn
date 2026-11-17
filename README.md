@@ -29,6 +29,14 @@ client (browser, kubectl, curl)
 - Live reconfiguration: adding, enabling or removing a profile takes effect without a restart.
 - The listening address is editable in the window: changing it restarts only the listener, tunnels keep
   running. It can also be overridden at launch with `--listen`.
+- Tray icon with a menu (show window / start / stop / quit). Closing the window hides it to the tray
+  instead of quitting; disable that with `minimize_to_tray: false`.
+- `launch at login` checkbox (HKCU Run key on Windows, LaunchAgent on macOS, autostart entry on Linux).
+- Everything slow runs in the background: engine downloads and sidecar starts never block the UI.
+- Per-profile status in the list, a `restart` button, and automatic restart 5 seconds after a sidecar
+  exits unexpectedly.
+- Duplicate configs are skipped on import, so re-importing a subscription does not multiply profiles.
+- A warning appears when a route (or the default route) points at a profile that is not running.
 - Routes pointing at a stopped profile are skipped, so traffic falls back to direct instead of
   hitting a dead port.
 - Per-request log in the window and in `%TEMP%\kubevpn-app.log`; each sidecar writes its own log
@@ -98,6 +106,19 @@ kubevpn.exe [--listen <addr>]
 
 `--listen` accepts `host:port` or a bare port number. It overrides the value from `config.json` for
 this run only; use the `Apply` button in the window to persist a new address.
+
+Environment variables, useful for scripted setup:
+
+| variable | effect |
+|---|---|
+| `KUBEVPN_IMPORT_URL` | import a subscription on startup |
+| `KUBEVPN_INSTALL_ENGINES` | comma-separated engines to install on startup (`awg,xray,singbox`) |
+| `KUBEVPN_AUTOSTART` | `1`/`0` — enable or disable launch at login, then exit the setting |
+
+## Tray
+
+The window can be closed to the tray; the tunnels keep running. The tray menu has *Show window*,
+*Start tunnels*, *Stop tunnels* and *Quit*. A double click on the icon shows the window.
 
 ## Configuration
 

@@ -6,9 +6,12 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+
 use crate::config::{self, AppConfig, Profile, Rule};
 use crate::engines;
 use crate::proxy::{self, Routes, Stats};
+use crate::tasks::{TaskResult, Tasks};
+use crate::tray::{Tray, TrayAction};
 use crate::util::{app_log, human, log, new_logs, proxy_from_env, Logs};
 
 pub struct App {
@@ -18,6 +21,13 @@ pub struct App {
     alive: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     children: HashMap<String, Child>,
+    profile_status: HashMap<String, String>,
+    restart_at: HashMap<String, Instant>,
+    tasks: Tasks,
+    tray: Option<Tray>,
+    last_health_check: Instant,
+    autostart_login: bool,
+    quitting: bool,
     routes: Arc<RwLock<Routes>>,
     running: bool,
     started_at: Option<Instant>,
@@ -50,6 +60,17 @@ impl App {
             alive: Arc::new(AtomicBool::new(false)),
             stop: Arc::new(AtomicBool::new(false)),
             children: HashMap::new(),
+            profile_status: HashMap::new(),
+            restart_at: HashMap::new(),
+            tasks: Tasks::new(),
+            tray: {
+                let t = Tray::new();
+                app_log(if t.is_ok() { "tray: created" } else { "tray: unavailable" });
+                t.ok()
+            },
+            last_health_check: Instant::now(),
+            autostart_login: autostart_state(),
+            quitting: false,
             routes: Arc::new(RwLock::new(Routes::default())),
             running: false,
             started_at: None,
@@ -60,6 +81,12 @@ impl App {
             new_rule_profile: String::new(),
             status: String::new(),
         };
+        if let Ok(v) = std::env::var("KUBEVPN_AUTOSTART") {
+            let enable = matches!(v.trim(), "1" | "true" | "on");
+            if set_autostart(enable).is_ok() {
+                app.autostart_login = enable;
+            }
+        }
         if let Ok(list) = std::env::var("KUBEVPN_INSTALL_ENGINES") {
             for key in list.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
                 app.install_engine(key);
@@ -103,16 +130,20 @@ impl App {
         self.profile_by_id(id).map(|p| p.port)
     }
 
-    fn add_profile(&mut self, text: String, origin: &str) {
-        self.add_profile_named(text, None, origin);
+    fn add_profile(&mut self, text: String, origin: &str) -> bool {
+        self.add_profile_named(text, None, origin)
     }
 
-    fn add_profile_named(&mut self, text: String, name: Option<String>, origin: &str) {
+    fn add_profile_named(&mut self, text: String, name: Option<String>, origin: &str) -> bool {
+        if self.cfg.profiles.iter().any(|p| p.text.trim() == text.trim()) {
+            self.status = format!("{}: this config is already present, skipped", origin);
+            return false;
+        }
         let kind = match config::detect_kind(&text) {
             Some(k) => k.to_string(),
             None => {
                 self.status = format!("{}: cannot recognise the config format", origin);
-                return;
+                return false;
             }
         };
         let id = self.next_id();
@@ -133,6 +164,7 @@ impl App {
         } else {
             self.status = format!("imported {} as {} (press Start to connect)", origin, id);
         }
+        true
     }
 
     fn fetch_url(&self, url: &str) -> Result<String> {
@@ -197,10 +229,11 @@ impl App {
                             continue;
                         }
                         let name = item.get("remarks").and_then(|r| r.as_str()).map(|s| s.to_string());
-                        self.add_profile_named(item.to_string(), name, origin);
-                        added += 1;
+                        if self.add_profile_named(item.to_string(), name, origin) {
+                            added += 1;
+                        }
                     }
-                    self.status = format!("imported {} of {} configs from {}", added, total, origin);
+                    self.status = format!("imported {} of {} configs from {} ({} skipped)", added, total, origin, total - added);
                 }
                 Err(e) => self.status = format!("{}: bad json array: {}", origin, e),
             }
@@ -219,18 +252,8 @@ impl App {
     }
 
     fn install_engine(&mut self, key: &str) {
-        self.status = format!("installing {}...", key);
-        match crate::install::install(key, &self.logs) {
-            Ok(path) => {
-                let p = path.to_string_lossy().to_string();
-                self.set_binary(key, &p);
-                self.status = format!("{} installed: {}", key, p);
-            }
-            Err(e) => {
-                log(&self.logs, format!("install {} failed: {}", key, e));
-                self.status = format!("install {} failed: {}", key, e);
-            }
-        }
+        self.status = format!("downloading {} in the background...", key);
+        self.tasks.install(key.to_string(), self.logs.clone());
     }
 
     fn bin_for(&self, kind: &str) -> String {
@@ -241,12 +264,17 @@ impl App {
         }
     }
 
-    fn spawn_profile(&mut self, p: &Profile) -> Result<()> {
-        let bin = self.bin_for(&p.kind);
-        app_log(&format!("spawning {} ({})", p.name, p.kind));
-        let child = engines::spawn(p, &bin, &self.logs)?;
-        self.children.insert(p.id.clone(), child);
-        Ok(())
+    /// Called from the background task result and from the health check.
+    fn adopt_child(&mut self, id: &str, child: Child) {
+        if self.running {
+            self.children.insert(id.to_string(), child);
+            self.profile_status.insert(id.to_string(), "up".to_string());
+            self.restart_at.remove(id);
+            self.refresh_routes();
+        } else {
+            let mut child = child;
+            let _ = child.kill();
+        }
     }
 
     fn build_routes(&self) -> Routes {
@@ -282,14 +310,22 @@ impl App {
             Some(p) if p.enabled => p.clone(),
             _ => return,
         };
-        match self.spawn_profile(&profile) {
-            Ok(()) => self.status = format!("{} started", profile.name),
-            Err(e) => {
-                log(&self.logs, format!("{} failed: {}", profile.name, e));
-                self.status = format!("{} failed: {}", profile.name, e);
-            }
+        let bin = self.bin_for(&profile.kind);
+        if bin.trim().is_empty() {
+            let msg = format!("no {} binary configured", profile.kind);
+            self.profile_status.insert(id.to_string(), msg.clone());
+            self.status = msg;
+            return;
         }
-        self.refresh_routes();
+        if !std::path::Path::new(&bin).exists() {
+            let msg = format!("binary not found: {}", bin);
+            self.profile_status.insert(id.to_string(), msg.clone());
+            self.status = msg;
+            return;
+        }
+        self.profile_status.insert(id.to_string(), "starting...".to_string());
+        self.tasks
+            .spawn_profile(id.to_string(), profile, bin, self.logs.clone());
     }
 
     fn stop_by_id(&mut self, id: &str) {
@@ -301,20 +337,56 @@ impl App {
         self.refresh_routes();
     }
 
+    fn check_children(&mut self) {
+        let mut dead: Vec<(String, String)> = Vec::new();
+        for (id, child) in self.children.iter_mut() {
+            if let Ok(Some(status)) = child.try_wait() {
+                dead.push((id.clone(), status.to_string()));
+            }
+        }
+        for (id, status) in dead {
+            self.children.remove(&id);
+            self.profile_status.insert(id.clone(), format!("exited ({})", status));
+            log(&self.logs, format!("profile {} exited: {}", id, status));
+            if self.running {
+                self.restart_at.insert(id, Instant::now() + Duration::from_secs(5));
+            }
+        }
+        if self.running {
+            self.refresh_routes();
+            let now = Instant::now();
+            let due: Vec<String> = self
+                .restart_at
+                .iter()
+                .filter(|(_, t)| **t <= now)
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in due {
+                self.restart_at.remove(&id);
+                let enabled = self.profile_by_id(&id).map(|p| p.enabled).unwrap_or(false);
+                if enabled {
+                    log(&self.logs, format!("restarting {}", id));
+                    self.spawn_by_id(&id);
+                }
+            }
+        }
+    }
+
     fn start(&mut self) {
         app_log("start() called");
         engines::kill_stale_sidecars(&self.logs);
         self.stop = Arc::new(AtomicBool::new(false));
         self.alive = Arc::new(AtomicBool::new(true));
         let profiles: Vec<Profile> = self.cfg.profiles.iter().filter(|p| p.enabled).cloned().collect();
-        for p in &profiles {
-            if let Err(e) = self.spawn_profile(p) {
-                app_log(&format!("{} failed: {}", p.name, e));
-                log(&self.logs, format!("{} failed: {}", p.name, e));
+        for p in profiles {
+            let bin = self.bin_for(&p.kind);
+            if bin.trim().is_empty() || !std::path::Path::new(&bin).exists() {
+                self.profile_status
+                    .insert(p.id.clone(), format!("binary for {} is not configured", p.kind));
+                continue;
             }
-        }
-        if self.children.is_empty() {
-            self.status = "no tunnels started".into();
+            self.profile_status.insert(p.id.clone(), "starting...".to_string());
+            self.tasks.spawn_profile(p.id.clone(), p, bin, self.logs.clone());
         }
         self.refresh_routes();
         self.start_listener();
@@ -370,10 +442,37 @@ impl App {
             log(&self.logs, format!("stopped {}", id));
         }
         self.children.clear();
+        self.profile_status.clear();
+        self.restart_at.clear();
         engines::clear_pid_file();
         self.running = false;
         config::save(&self.cfg);
     }
+}
+
+fn autostart_builder() -> Option<auto_launch::AutoLaunch> {
+    let exe = std::env::current_exe().ok()?.to_string_lossy().to_string();
+    auto_launch::AutoLaunchBuilder::new()
+        .set_app_name("kubevpn")
+        .set_app_path(&exe)
+        .build()
+        .ok()
+}
+
+fn autostart_state() -> bool {
+    autostart_builder()
+        .and_then(|a| a.is_enabled().ok())
+        .unwrap_or(false)
+}
+
+fn set_autostart(enable: bool) -> Result<()> {
+    let app = autostart_builder().ok_or_else(|| anyhow::anyhow!("cannot resolve the executable path"))?;
+    if enable {
+        app.enable()?;
+    } else {
+        app.disable()?;
+    }
+    Ok(())
 }
 
 impl Drop for App {
@@ -391,11 +490,84 @@ impl eframe::App for App {
         }
         ctx.request_repaint_after(Duration::from_millis(300));
 
+        while let Some(res) = self.tasks.try_recv() {
+            match res {
+                TaskResult::Spawned { id, result } => match result {
+                    Ok(child) => self.adopt_child(&id, child),
+                    Err(e) => {
+                        self.profile_status.insert(id.clone(), e.clone());
+                        log(&self.logs, format!("profile {} failed: {}", id, e));
+                    }
+                },
+                TaskResult::Installed { key, result } => match result {
+                    Ok(path) => {
+                        let p = path.to_string_lossy().to_string();
+                        self.set_binary(&key, &p);
+                        self.status = format!("{} installed: {}", key, p);
+                    }
+                    Err(e) => {
+                        log(&self.logs, format!("install {} failed: {}", key, e));
+                        self.status = format!("install {} failed: {}", key, e);
+                    }
+                },
+            }
+        }
+
+        let actions = self.tray.as_ref().map(|t| t.poll()).unwrap_or_default();
+        for action in actions {
+            match action {
+                TrayAction::Show => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                TrayAction::Start => {
+                    if !self.running {
+                        self.start();
+                    }
+                }
+                TrayAction::Stop => self.stop(),
+                TrayAction::Quit => {
+                    self.quitting = true;
+                    self.stop();
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+
+        if self.cfg.minimize_to_tray && !self.quitting && ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+
+        if self.last_health_check.elapsed() > Duration::from_secs(2) {
+            self.last_health_check = Instant::now();
+            self.check_children();
+        }
+
         if !ctx.input(|i| i.raw.dropped_files.is_empty()) {
             let files: Vec<PathBuf> = ctx
                 .input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
             for f in files {
                 self.import_file(&f.to_string_lossy());
+            }
+        }
+
+        let mut warnings: Vec<String> = Vec::new();
+        if self.running {
+            for r in &self.cfg.rules {
+                if !self.children.contains_key(&r.profile) {
+                    let name = self
+                        .profile_by_id(&r.profile)
+                        .map(|p| p.name.clone())
+                        .unwrap_or_else(|| r.profile.clone());
+                    warnings.push(format!(".{} -> {} is not running: traffic goes direct", r.suffix, name));
+                }
+            }
+            if let Some(dp) = self.cfg.default_profile.clone() {
+                if !self.children.contains_key(&dp) {
+                    let name = self.profile_by_id(&dp).map(|p| p.name.clone()).unwrap_or(dp.clone());
+                    warnings.push(format!("default route -> {} is not running: traffic goes direct", name));
+                }
             }
         }
 
@@ -453,6 +625,9 @@ impl eframe::App for App {
             if !self.status.is_empty() {
                 ui.label(egui::RichText::new(&self.status).weak().italics());
             }
+            for w in &warnings {
+                ui.colored_label(egui::Color32::from_rgb(230, 180, 90), format!("warning: {}", w));
+            }
             ui.add_space(6.0);
         });
 
@@ -491,6 +666,7 @@ impl eframe::App for App {
             ui.add_space(6.0);
 
             let mut remove: Option<String> = None;
+            let mut restart: Option<String> = None;
             let mut toggle: Option<(String, bool)> = None;
             for p in self.cfg.profiles.iter_mut() {
                 ui.horizontal(|ui| {
@@ -506,12 +682,29 @@ impl eframe::App for App {
                     ui.colored_label(color, if running { "on" } else { "off" });
                     ui.label(&p.name);
                     ui.label(egui::RichText::new(format!("{} :{}", p.kind, p.port)).weak().small());
+                    if !running {
+                        if let Some(st) = self.profile_status.get(&p.id) {
+                            let short: String = st.chars().take(60).collect();
+                            ui.label(egui::RichText::new(short).small().color(egui::Color32::from_rgb(230, 170, 90)));
+                        }
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("x").clicked() {
                             remove = Some(p.id.clone());
                         }
+                        if ui.small_button("restart").clicked() {
+                            restart = Some(p.id.clone());
+                        }
                     });
                 });
+            }
+            if let Some(id) = restart {
+                if self.running {
+                    self.stop_by_id(&id);
+                    self.spawn_by_id(&id);
+                } else {
+                    self.status = "press Start first".into();
+                }
             }
             if let Some((id, enabled)) = toggle {
                 config::save(&self.cfg);
@@ -660,6 +853,18 @@ impl eframe::App for App {
             if ui.button("Save settings").clicked() {
                 config::save(&self.cfg);
                 self.status = "settings saved".into();
+            }
+            ui.add_space(6.0);
+            let mut login = self.autostart_login;
+            if ui.checkbox(&mut login, "launch at login").changed() {
+                self.autostart_login = login;
+                match set_autostart(login) {
+                    Ok(()) => self.status = if login { "will start at login".into() } else { "login autostart off".into() },
+                    Err(e) => self.status = format!("autostart: {}", e),
+                }
+            }
+            if ui.checkbox(&mut self.cfg.minimize_to_tray, "minimize to tray on close").changed() {
+                config::save(&self.cfg);
             }
         });
 

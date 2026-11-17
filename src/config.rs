@@ -49,6 +49,8 @@ pub struct AppConfig {
     pub rules: Vec<Rule>,
     #[serde(default)]
     pub default_profile: Option<String>,
+    #[serde(default = "default_true")]
+    pub minimize_to_tray: bool,
 }
 
 impl Default for AppConfig {
@@ -60,6 +62,7 @@ impl Default for AppConfig {
             profiles: Vec::new(),
             rules: Vec::new(),
             default_profile: None,
+            minimize_to_tray: true,
         }
     }
 }
