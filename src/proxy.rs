@@ -18,27 +18,49 @@ pub struct Stats {
 
 #[derive(Clone, Default)]
 pub struct Routes {
-    pub rules: Vec<(String, u16)>,
+    /// Domain suffix and the local port to use; None means the target profile is not running.
+    pub rules: Vec<(String, Option<u16>)>,
+    /// Port for everything that matches no rule.
     pub default: Option<u16>,
+    /// True when a default profile is configured, whether or not it is running.
+    pub default_configured: bool,
+    /// Refuse traffic instead of sending it direct when the target profile is not running.
+    pub fail_closed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Decision {
+    Direct,
+    Via(u16),
+    Blocked,
 }
 
 impl Routes {
-    pub fn pick(&self, host: &str) -> Option<u16> {
+    pub fn pick(&self, host: &str) -> Decision {
         let h = host.to_ascii_lowercase();
         for (suffix, port) in &self.rules {
             let s = suffix.trim_start_matches('.').to_ascii_lowercase();
             if h == s || h.ends_with(&format!(".{}", s)) {
-                return Some(*port);
+                return match port {
+                    Some(p) => Decision::Via(*p),
+                    None if self.fail_closed => Decision::Blocked,
+                    None => Decision::Direct,
+                };
             }
         }
-        self.default
+        match self.default {
+            Some(p) => Decision::Via(p),
+            None if self.default_configured && self.fail_closed => Decision::Blocked,
+            None => Decision::Direct,
+        }
     }
 }
 
-fn describe(up: Option<u16>) -> String {
-    match up {
-        None => "direct".to_string(),
-        Some(p) => format!("127.0.0.1:{}", p),
+fn describe(decision: Decision) -> String {
+    match decision {
+        Decision::Direct => "direct".to_string(),
+        Decision::Via(p) => format!("127.0.0.1:{}", p),
+        Decision::Blocked => "blocked (target profile is down)".to_string(),
     }
 }
 
@@ -161,9 +183,18 @@ async fn handle_socks(
     s.read_exact(&mut pb).await?;
     let port = u16::from_be_bytes(pb);
 
-    let up = routes.read().unwrap().pick(&host);
-    app_log(&format!("socks5 {}:{} -> {}", host, port, describe(up)));
-    log(&logs, format!("socks {}:{} -> {}", host, port, describe(up)));
+    let decision = routes.read().unwrap().pick(&host);
+    app_log(&format!("socks5 {}:{} -> {}", host, port, describe(decision)));
+    log(&logs, format!("socks {}:{} -> {}", host, port, describe(decision)));
+    if decision == Decision::Blocked {
+        s.write_all(&socks_reply(false)).await?;
+        log(&logs, format!("blocked {}:{} (target profile is not running)", host, port));
+        return Ok(());
+    }
+    let up = match decision {
+        Decision::Via(p) => Some(p),
+        _ => None,
+    };
 
     match connect_via(&host, port, up).await {
         Ok(remote) => {
@@ -216,9 +247,18 @@ async fn handle_http(
 
     if method.eq_ignore_ascii_case("CONNECT") {
         let (host, port) = split_host_port(&target)?;
-        let up = routes.read().unwrap().pick(&host);
-        app_log(&format!("http-connect {}:{} -> {}", host, port, describe(up)));
-        log(&logs, format!("http CONNECT {}:{} -> {}", host, port, describe(up)));
+        let decision = routes.read().unwrap().pick(&host);
+        app_log(&format!("http-connect {}:{} -> {}", host, port, describe(decision)));
+        log(&logs, format!("http CONNECT {}:{} -> {}", host, port, describe(decision)));
+        if decision == Decision::Blocked {
+            s.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n").await?;
+            log(&logs, format!("blocked {}:{} (target profile is not running)", host, port));
+            return Ok(());
+        }
+        let up = match decision {
+            Decision::Via(p) => Some(p),
+            _ => None,
+        };
         match connect_via(&host, port, up).await {
             Ok(remote) => {
                 s.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
@@ -242,9 +282,18 @@ async fn handle_http(
             Some((h, p)) => (h.to_string(), p.parse::<u16>()?),
             None => (authority.to_string(), 80u16),
         };
-        let up = routes.read().unwrap().pick(&host);
-        app_log(&format!("http {} {}:{} -> {}", method, host, port, describe(up)));
-        log(&logs, format!("http {} {}:{} -> {}", method, host, port, describe(up)));
+        let decision = routes.read().unwrap().pick(&host);
+        app_log(&format!("http {} {}:{} -> {}", method, host, port, describe(decision)));
+        log(&logs, format!("http {} {}:{} -> {}", method, host, port, describe(decision)));
+        if decision == Decision::Blocked {
+            s.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n").await?;
+            log(&logs, format!("blocked {}:{} (target profile is not running)", host, port));
+            return Ok(());
+        }
+        let up = match decision {
+            Decision::Via(p) => Some(p),
+            _ => None,
+        };
         let mut remote = connect_via(&host, port, up).await?;
         let mut out = format!("{} {} HTTP/1.1\r\n", method, path);
         for line in head.lines().skip(1) {

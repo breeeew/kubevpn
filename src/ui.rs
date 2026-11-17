@@ -293,20 +293,26 @@ impl App {
     fn build_routes(&self) -> Routes {
         let mut rules = Vec::new();
         for r in &self.cfg.rules {
-            if !self.children.contains_key(&r.profile) {
-                continue;
-            }
-            if let Some(port) = self.port_of(&r.profile) {
-                rules.push((r.suffix.clone(), port));
-            }
+            let port = if self.children.contains_key(&r.profile) {
+                self.port_of(&r.profile)
+            } else {
+                None
+            };
+            rules.push((r.suffix.clone(), port));
         }
+        let default_configured = self.cfg.default_profile.is_some();
         let default = self
             .cfg
             .default_profile
             .as_deref()
             .filter(|id| self.children.contains_key(*id))
             .and_then(|id| self.port_of(id));
-        Routes { rules, default }
+        Routes {
+            rules,
+            default,
+            default_configured,
+            fail_closed: self.cfg.fail_closed,
+        }
     }
 
     fn refresh_routes(&self) {
@@ -647,6 +653,7 @@ impl eframe::App for App {
         }
 
         let mut warnings: Vec<String> = Vec::new();
+        let fallback = if self.cfg.fail_closed { "traffic is blocked" } else { "traffic goes direct" };
         if self.running {
             for r in &self.cfg.rules {
                 if !self.children.contains_key(&r.profile) {
@@ -654,13 +661,13 @@ impl eframe::App for App {
                         .profile_by_id(&r.profile)
                         .map(|p| p.name.clone())
                         .unwrap_or_else(|| r.profile.clone());
-                    warnings.push(format!(".{} -> {} is not running: traffic goes direct", r.suffix, name));
+                    warnings.push(format!(".{} -> {} is not running: {}", r.suffix, name, fallback));
                 }
             }
             if let Some(dp) = self.cfg.default_profile.clone() {
                 if !self.children.contains_key(&dp) {
                     let name = self.profile_by_id(&dp).map(|p| p.name.clone()).unwrap_or(dp.clone());
-                    warnings.push(format!("default route -> {} is not running: traffic goes direct", name));
+                    warnings.push(format!("default route -> {} is not running: {}", name, fallback));
                 }
             }
         }
@@ -959,6 +966,21 @@ impl eframe::App for App {
             }
             if ui.checkbox(&mut self.cfg.minimize_to_tray, "minimize to tray on close").changed() {
                 config::save(&self.cfg);
+            }
+            if ui
+                .checkbox(
+                    &mut self.cfg.fail_closed,
+                    "block traffic when the target profile is down",
+                )
+                .changed()
+            {
+                config::save(&self.cfg);
+                self.refresh_routes();
+                self.status = if self.cfg.fail_closed {
+                    "routes to stopped profiles now block traffic".into()
+                } else {
+                    "routes to stopped profiles now fall back to direct".into()
+                };
             }
         });
 

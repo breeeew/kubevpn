@@ -37,6 +37,9 @@ client (browser, kubectl, curl)
   exits unexpectedly.
 - Duplicate configs are skipped on import, so re-importing a subscription does not multiply profiles.
 - A warning appears when a route (or the default route) points at a profile that is not running.
+- Choose what happens in that case: fall back to a direct connection (default) or refuse the
+  connection. The checkbox `block traffic when the target profile is down` switches to fail closed,
+  which also covers the first seconds after start-up while profiles are still coming up.
 - Routes pointing at a stopped profile are skipped, so traffic falls back to direct instead of
   hitting a dead port.
 - Per-request log in the window and in `%TEMP%\kubevpn-app.log`; each sidecar writes its own log
@@ -139,6 +142,8 @@ A diagnostic switch `KUBEVPN_TEST_TRAY=1` hides the window after 6 seconds and s
 | `profiles[]` | `id`, `name`, `kind` (`awg` / `xray` / `singbox`), `text` (the raw config), `port` (local SOCKS port the engine listens on), `enabled` |
 | `rules[]` | `suffix` + `profile` id |
 | `default_profile` | profile id for everything that matches no rule, `null` means direct |
+| `fail_closed` | `false` (default): a rule whose target profile is down falls back to direct; `true`: such traffic is refused |
+| `minimize_to_tray` | closing the window keeps the app running in the tray |
 
 The app rewrites the engine config before starting it: for AWG it appends a `[Socks5]` section, for
 Xray and sing-box it replaces `inbounds` with a single local SOCKS inbound on `profile.port`.

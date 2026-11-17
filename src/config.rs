@@ -51,6 +51,10 @@ pub struct AppConfig {
     pub default_profile: Option<String>,
     #[serde(default = "default_true")]
     pub minimize_to_tray: bool,
+    /// When a rule (or the default route) points at a profile that is not running:
+    /// false - fall back to a direct connection, true - refuse the connection.
+    #[serde(default)]
+    pub fail_closed: bool,
 }
 
 impl Default for AppConfig {
@@ -63,6 +67,7 @@ impl Default for AppConfig {
             rules: Vec::new(),
             default_profile: None,
             minimize_to_tray: true,
+            fail_closed: false,
         }
     }
 }
