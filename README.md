@@ -86,7 +86,8 @@ Engines are third-party software with their own licenses; the app only downloads
 
 - Rust toolchain.
 - On Linux, the usual egui/winit development packages:
-  `libgtk-3-dev libxkbcommon-dev libwayland-dev libx11-dev libxi-dev libgl1-mesa-dev`.
+  `libgtk-3-dev libxkbcommon-dev libwayland-dev libx11-dev libxi-dev libgl1-mesa-dev`,
+  plus `libxdo-dev` for the clipboard (`arboard`).
 - The engine binaries listed above.
 
 ## Build
@@ -100,6 +101,32 @@ On Windows either the MSVC toolchain (Visual Studio Build Tools) or the GNU one
 
 The binary lands in `target/release/kubevpn.exe` (or `target/<triple>/release/`).
 Put `config.json` next to the binary, or run it from the directory that contains the config.
+
+## CI
+
+The workflow runs on a self-hosted Linux runner with the labels `self-hosted`, `linux`, `x64`:
+
+- `fmt + clippy` — `cargo fmt --all --check` and `cargo clippy --all-targets -- -D warnings`;
+- `tests` — `cargo test --locked`;
+- `build` — release build, the binary is uploaded as an artifact;
+- `release` — on a `v*` tag, packs the artifact and publishes a GitHub Release.
+
+The runner machine needs the Linux dependencies listed above. GitHub-hosted runners are not used:
+the account that owns this repository has a billing lock, so `windows-latest` and `macos-latest`
+jobs were dropped. When billing is resolved, they can be added back by extending the `runs-on`
+of each job into a matrix.
+
+Registering a runner (once):
+
+```bash
+mkdir -p /opt/actions-runner && cd /opt/actions-runner
+curl -fsSL -o runner.tar.gz https://github.com/actions/runner/releases/download/v<version>/actions-runner-linux-x64-<version>.tar.gz
+tar xzf runner.tar.gz
+./config.sh --url https://github.com/<owner>/<repo> --token <registration-token> \
+  --name <name> --labels self-hosted,linux,x64 --unattended --replace
+```
+
+Then run `./run.sh` as a systemd service, or `./svc.sh install && ./svc.sh start`.
 
 ## Local checks
 
