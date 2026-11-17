@@ -101,6 +101,18 @@ On Windows either the MSVC toolchain (Visual Studio Build Tools) or the GNU one
 The binary lands in `target/release/kubevpn.exe` (or `target/<triple>/release/`).
 Put `config.json` next to the binary, or run it from the directory that contains the config.
 
+## Local checks
+
+The same three checks run by CI can be executed locally:
+
+```bash
+./scripts/check.sh        # Linux and macOS
+```
+
+```powershell
+./scripts/check.ps1       # Windows
+```
+
 ## Command line
 
 ```text
