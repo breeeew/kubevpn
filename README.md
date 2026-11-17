@@ -34,19 +34,37 @@ client (browser, kubectl, curl)
 - Per-request log in the window and in `%TEMP%\kubevpn-app.log`; each sidecar writes its own log
   to `%TEMP%\kubevpn-profiles\<id>.log`.
 
+## Platform support
+
+The application itself is cross-platform: the UI is egui/eframe, HTTP is done with `ureq`, and stale
+sidecar cleanup uses `sysinfo`. Platform-specific behaviour (hiding the console of child processes) is
+isolated behind a small `#[cfg(windows)]` helper.
+
+| platform | status |
+|---|---|
+| Windows 10/11 | primary target, tested |
+| Linux (X11 / Wayland) | builds in CI, needs a GPU/GL stack for the window |
+| macOS | builds in CI |
+
+Engine binaries are separate executables, so on each platform you need builds of the engines you
+actually use: `wireproxy` (`wireproxy.exe` on Windows), `xray`, `sing-box`. Paths are configured in
+the app and are not built into it.
+
 ## Requirements
 
-- Windows 10/11. The code uses Windows-specific process flags; other platforms are not supported yet.
-- The engine binaries are **not bundled**. Point the app at the ones you have:
-  `wireproxy.exe`, `xray.exe`, `sing-box.exe`.
-- Rust toolchain to build.
+- Rust toolchain.
+- On Linux, the usual egui/winit development packages:
+  `libgtk-3-dev libxkbcommon-dev libwayland-dev libx11-dev libxi-dev libgl1-mesa-dev`.
+- The engine binaries listed above.
 
 ## Build
 
-```powershell
-rustup default stable-x86_64-pc-windows-gnu   # or the MSVC toolchain with Visual Studio Build Tools
+```bash
 cargo build --release
 ```
+
+On Windows either the MSVC toolchain (Visual Studio Build Tools) or the GNU one
+(`rustup default stable-x86_64-pc-windows-gnu` plus a MinGW distribution) works.
 
 The binary lands in `target/release/kubevpn.exe` (or `target/<triple>/release/`).
 Put `config.json` next to the binary, or run it from the directory that contains the config.

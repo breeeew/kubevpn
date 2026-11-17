@@ -3,14 +3,9 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
 
 use crate::config::Profile;
-use crate::util::{app_log, log, strip_ansi, Logs};
-
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+use crate::util::{app_log, hide_console, log, strip_ansi, Logs};
 
 pub fn profile_dir() -> PathBuf {
     std::env::temp_dir().join("kubevpn-profiles")
@@ -80,7 +75,7 @@ fn pids_file() -> PathBuf {
     std::env::temp_dir().join("kubevpn-sidecars.txt")
 }
 
-fn record_pid(name: &str, pid: u32) {
+pub fn record_pid(name: &str, pid: u32) {
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(pids_file()) {
         let _ = writeln!(f, "{} {}", name, pid);
@@ -88,20 +83,24 @@ fn record_pid(name: &str, pid: u32) {
 }
 
 /// Kill sidecars left behind by a previous (possibly crashed) run.
+/// Uses sysinfo, so it works the same on every supported platform.
 pub fn kill_stale_sidecars(logs: &Logs) {
     let mut killed = 0;
     if let Ok(text) = std::fs::read_to_string(pids_file()) {
+        let mut sys = sysinfo::System::new_all();
+        sys.refresh_all();
         for line in text.lines() {
             let mut it = line.split_whitespace();
-            let name = it.next().unwrap_or("");
+            let _name = it.next().unwrap_or("");
             let pid = it.next().and_then(|s| s.parse::<u32>().ok());
-            if let (Some(pid), true) = (pid, name == "wireproxy.exe" || name == "xray.exe" || name == "sing-box.exe") {
-                let mut cmd = Command::new("taskkill");
-                cmd.args(["/PID", &pid.to_string(), "/F"]);
-                #[cfg(windows)]
-                cmd.creation_flags(CREATE_NO_WINDOW);
-                let _ = cmd.output();
-                killed += 1;
+            if let Some(pid) = pid {
+                if let Some(proc_) = sys.process(sysinfo::Pid::from_u32(pid)) {
+                    let pname = proc_.name().to_string_lossy().to_lowercase();
+                    if pname.contains("wireproxy") || pname.contains("xray") || pname.contains("sing-box") {
+                        proc_.kill();
+                        killed += 1;
+                    }
+                }
             }
         }
     }
@@ -149,8 +148,7 @@ pub fn spawn(p: &Profile, bin: &str, logs: &Logs) -> Result<Child> {
         cmd.arg("-c").arg(&cfg_file);
     }
     cmd.stdin(Stdio::null()).stdout(Stdio::from(out)).stderr(Stdio::from(err));
-    #[cfg(windows)]
-    cmd.creation_flags(CREATE_NO_WINDOW);
+    hide_console(&mut cmd);
 
     let mut child = cmd.spawn()?;
     let bin_name = Path::new(bin)

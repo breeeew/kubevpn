@@ -1,14 +1,11 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Result};
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
-
+use anyhow::Result;
 use crate::config::{self, AppConfig, Profile, Rule};
 use crate::engines;
 use crate::proxy::{self, Routes, Stats};
@@ -134,16 +131,18 @@ impl App {
     }
 
     fn fetch_url(&self, url: &str) -> Result<String> {
-        let mut cmd = Command::new("curl");
-        cmd.args(["-sS", "-L", "--max-time", "30", "-A", "v2rayNG/1.9.16", url]);
-        cmd.stdin(Stdio::null());
-        #[cfg(windows)]
-        cmd.creation_flags(0x0800_0000);
-        let out = cmd.output()?;
-        if !out.status.success() {
-            bail!("fetch failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        let mut builder = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(30))
+            .user_agent("v2rayNG/1.9.16");
+        if let Some(p) = proxy_from_env() {
+            match ureq::Proxy::new(&p) {
+                Ok(proxy) => builder = builder.proxy(proxy),
+                Err(e) => app_log(&format!("ignoring proxy {}: {}", p, e)),
+            }
         }
-        Ok(String::from_utf8_lossy(&out.stdout).to_string())
+        let agent = builder.build();
+        let body = agent.get(url).call()?.into_string()?;
+        Ok(body)
     }
 
     fn import_from_url(&mut self, url: &str) {
@@ -346,6 +345,19 @@ impl App {
         self.running = false;
         config::save(&self.cfg);
     }
+}
+
+/// Honor the usual proxy environment variables for subscription downloads.
+fn proxy_from_env() -> Option<String> {
+    for key in ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy"] {
+        if let Ok(v) = std::env::var(key) {
+            let v = v.trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
 }
 
 impl Drop for App {
