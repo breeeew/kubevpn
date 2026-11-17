@@ -50,6 +50,27 @@ Engine binaries are separate executables, so on each platform you need builds of
 actually use: `wireproxy` (`wireproxy.exe` on Windows), `xray`, `sing-box`. Paths are configured in
 the app and are not built into it.
 
+## Installing the engines
+
+The app can fetch them itself from GitHub releases: each engine row in the settings has an
+`install` button. It asks the GitHub API for the latest release, picks the asset that matches your OS
+and architecture, downloads it, verifies the SHA-256 when the release publishes `checksums.txt`
+(awg-wireproxy does) and unpacks it into:
+
+- Windows: `%LOCALAPPDATA%\kubevpn\engines\<engine>`
+- Linux/macOS: `$XDG_DATA_HOME/kubevpn/engines/<engine>` (or `~/.local/share/...`)
+
+The resolved path is written back into `config.json`. For headless setup, launch with
+`KUBEVPN_INSTALL_ENGINES=awg,xray,singbox` and the app installs the listed engines on startup.
+
+| engine | source |
+|---|---|
+| awg-wireproxy | `bropines/awg-wireproxy` |
+| xray | `XTLS/Xray-core` |
+| sing-box | `SagerNet/sing-box` |
+
+Engines are third-party software with their own licenses; the app only downloads them.
+
 ## Requirements
 
 - Rust toolchain.

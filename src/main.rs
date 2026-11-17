@@ -2,6 +2,7 @@
 
 mod config;
 mod engines;
+mod install;
 mod proxy;
 mod ui;
 mod util;

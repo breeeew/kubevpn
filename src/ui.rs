@@ -9,7 +9,7 @@ use anyhow::Result;
 use crate::config::{self, AppConfig, Profile, Rule};
 use crate::engines;
 use crate::proxy::{self, Routes, Stats};
-use crate::util::{app_log, human, log, new_logs, Logs};
+use crate::util::{app_log, human, log, new_logs, proxy_from_env, Logs};
 
 pub struct App {
     cfg: AppConfig,
@@ -60,6 +60,11 @@ impl App {
             new_rule_profile: String::new(),
             status: String::new(),
         };
+        if let Ok(list) = std::env::var("KUBEVPN_INSTALL_ENGINES") {
+            for key in list.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                app.install_engine(key);
+            }
+        }
         if let Ok(url) = std::env::var("KUBEVPN_IMPORT_URL") {
             if !url.trim().is_empty() {
                 app.import_from_url(&url);
@@ -204,6 +209,30 @@ impl App {
         }
     }
 
+    fn set_binary(&mut self, key: &str, path: &str) {
+        match key {
+            "awg" => self.cfg.binaries.awg = path.to_string(),
+            "xray" => self.cfg.binaries.xray = path.to_string(),
+            _ => self.cfg.binaries.singbox = path.to_string(),
+        }
+        config::save(&self.cfg);
+    }
+
+    fn install_engine(&mut self, key: &str) {
+        self.status = format!("installing {}...", key);
+        match crate::install::install(key, &self.logs) {
+            Ok(path) => {
+                let p = path.to_string_lossy().to_string();
+                self.set_binary(key, &p);
+                self.status = format!("{} installed: {}", key, p);
+            }
+            Err(e) => {
+                log(&self.logs, format!("install {} failed: {}", key, e));
+                self.status = format!("install {} failed: {}", key, e);
+            }
+        }
+    }
+
     fn bin_for(&self, kind: &str) -> String {
         match kind {
             "awg" => self.cfg.binaries.awg.clone(),
@@ -345,19 +374,6 @@ impl App {
         self.running = false;
         config::save(&self.cfg);
     }
-}
-
-/// Honor the usual proxy environment variables for subscription downloads.
-fn proxy_from_env() -> Option<String> {
-    for key in ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy"] {
-        if let Ok(v) = std::env::var(key) {
-            let v = v.trim();
-            if !v.is_empty() {
-                return Some(v.to_string());
-            }
-        }
-    }
-    None
 }
 
 impl Drop for App {
@@ -621,16 +637,26 @@ impl eframe::App for App {
             ui.label(egui::RichText::new("Engine binaries").strong());
             ui.horizontal(|ui| {
                 ui.label("awg-wireproxy:");
-                ui.add(egui::TextEdit::singleline(&mut self.cfg.binaries.awg).desired_width(250.0));
+                ui.add(egui::TextEdit::singleline(&mut self.cfg.binaries.awg).desired_width(220.0));
+                if ui.small_button("install").clicked() {
+                    self.install_engine("awg");
+                }
             });
             ui.horizontal(|ui| {
                 ui.label("xray:");
-                ui.add(egui::TextEdit::singleline(&mut self.cfg.binaries.xray).desired_width(250.0));
+                ui.add(egui::TextEdit::singleline(&mut self.cfg.binaries.xray).desired_width(220.0));
+                if ui.small_button("install").clicked() {
+                    self.install_engine("xray");
+                }
             });
             ui.horizontal(|ui| {
                 ui.label("sing-box:");
-                ui.add(egui::TextEdit::singleline(&mut self.cfg.binaries.singbox).desired_width(250.0));
+                ui.add(egui::TextEdit::singleline(&mut self.cfg.binaries.singbox).desired_width(220.0));
+                if ui.small_button("install").clicked() {
+                    self.install_engine("singbox");
+                }
             });
+            ui.label(egui::RichText::new("install pulls the latest GitHub release and verifies its checksum").weak().small());
             if ui.button("Save settings").clicked() {
                 config::save(&self.cfg);
                 self.status = "settings saved".into();

@@ -31,6 +31,19 @@ pub fn app_log(msg: &str) {
     }
 }
 
+/// Honor the usual proxy environment variables for outbound HTTP requests.
+pub fn proxy_from_env() -> Option<String> {
+    for key in ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy"] {
+        if let Ok(v) = std::env::var(key) {
+            let v = v.trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Hide the console window of a child process on Windows; no-op elsewhere.
 #[cfg(windows)]
 pub fn hide_console(cmd: &mut std::process::Command) {
