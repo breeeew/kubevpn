@@ -17,7 +17,9 @@ pub fn awg_effective(text: &str, port: u16) -> String {
     for line in text.lines() {
         let t = line.trim();
         if t.starts_with('[') && t.ends_with(']') {
-            let name = t.trim_matches(|c| c == '[' || c == ']').to_ascii_lowercase();
+            let name = t
+                .trim_matches(|c| c == '[' || c == ']')
+                .to_ascii_lowercase();
             skip = name == "socks5" || name == "http";
             if skip {
                 continue;
@@ -77,7 +79,11 @@ fn pids_file() -> PathBuf {
 
 pub fn record_pid(name: &str, pid: u32) {
     use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(pids_file()) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(pids_file())
+    {
         let _ = writeln!(f, "{} {}", name, pid);
     }
 }
@@ -96,7 +102,10 @@ pub fn kill_stale_sidecars(logs: &Logs) {
             if let Some(pid) = pid {
                 if let Some(proc_) = sys.process(sysinfo::Pid::from_u32(pid)) {
                     let pname = proc_.name().to_string_lossy().to_lowercase();
-                    if pname.contains("wireproxy") || pname.contains("xray") || pname.contains("sing-box") {
+                    if pname.contains("wireproxy")
+                        || pname.contains("xray")
+                        || pname.contains("sing-box")
+                    {
                         proc_.kill();
                         killed += 1;
                     }
@@ -147,7 +156,9 @@ pub fn spawn(p: &Profile, bin: &str, logs: &Logs) -> Result<Child> {
     } else {
         cmd.arg("-c").arg(&cfg_file);
     }
-    cmd.stdin(Stdio::null()).stdout(Stdio::from(out)).stderr(Stdio::from(err));
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::from(out))
+        .stderr(Stdio::from(err));
     hide_console(&mut cmd);
 
     let mut child = cmd.spawn()?;
@@ -167,6 +178,11 @@ pub fn spawn(p: &Profile, bin: &str, logs: &Logs) -> Result<Child> {
         let hint: Vec<&str> = tail.lines().rev().take(2).collect();
         let hint: String = hint.into_iter().rev().collect::<Vec<_>>().join(" | ");
         app_log(&format!("{} failed: {}", p.name, hint));
-        bail!("{} did not open port {}: {}", p.name, p.port, strip_ansi(hint.trim()))
+        bail!(
+            "{} did not open port {}: {}",
+            p.name,
+            p.port,
+            strip_ansi(hint.trim())
+        )
     }
 }

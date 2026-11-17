@@ -12,9 +12,18 @@ pub struct Engine {
 }
 
 pub const ENGINES: [Engine; 3] = [
-    Engine { key: "awg", repo: "bropines/awg-wireproxy" },
-    Engine { key: "xray", repo: "XTLS/Xray-core" },
-    Engine { key: "singbox", repo: "SagerNet/sing-box" },
+    Engine {
+        key: "awg",
+        repo: "bropines/awg-wireproxy",
+    },
+    Engine {
+        key: "xray",
+        repo: "XTLS/Xray-core",
+    },
+    Engine {
+        key: "singbox",
+        repo: "SagerNet/sing-box",
+    },
 ];
 
 #[derive(Deserialize)]
@@ -37,7 +46,9 @@ pub fn engine_dir() -> PathBuf {
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
     };
-    base.unwrap_or_else(|| std::env::temp_dir()).join("kubevpn").join("engines")
+    base.unwrap_or_else(std::env::temp_dir)
+        .join("kubevpn")
+        .join("engines")
 }
 
 fn agent() -> ureq::Agent {
@@ -66,11 +77,7 @@ fn download(url: &str, dest: &Path) -> Result<()> {
 }
 
 fn arch_tag() -> &'static str {
-    match std::env::consts::ARCH {
-        "x86_64" => "x86_64",
-        "aarch64" => "aarch64",
-        other => other,
-    }
+    std::env::consts::ARCH
 }
 
 /// Pick the release asset that matches this platform for the given engine.
@@ -85,17 +92,35 @@ fn pick_asset(key: &str, assets: &[Asset]) -> Option<Asset> {
             }
             match key {
                 "awg" => {
-                    let want_os = if cfg!(windows) { "windows" } else if cfg!(target_os = "macos") { "darwin" } else { "linux" };
+                    let want_os = if cfg!(windows) {
+                        "windows"
+                    } else if cfg!(target_os = "macos") {
+                        "darwin"
+                    } else {
+                        "linux"
+                    };
                     let want_arch = if arch == "aarch64" { "arm64" } else { "amd64" };
                     n.contains(want_os) && n.contains(want_arch)
                 }
                 "xray" => {
-                    let want_os = if cfg!(windows) { "windows" } else if cfg!(target_os = "macos") { "macos" } else { "linux" };
+                    let want_os = if cfg!(windows) {
+                        "windows"
+                    } else if cfg!(target_os = "macos") {
+                        "macos"
+                    } else {
+                        "linux"
+                    };
                     let want_arch = if arch == "aarch64" { "arm64" } else { "-64" };
                     n.contains(want_os) && n.contains(want_arch)
                 }
                 "singbox" => {
-                    let want_os = if cfg!(windows) { "windows" } else if cfg!(target_os = "macos") { "darwin" } else { "linux" };
+                    let want_os = if cfg!(windows) {
+                        "windows"
+                    } else if cfg!(target_os = "macos") {
+                        "darwin"
+                    } else {
+                        "linux"
+                    };
                     let want_arch = if arch == "aarch64" { "arm64" } else { "amd64" };
                     n.contains(want_os) && n.contains(want_arch)
                 }
@@ -141,7 +166,8 @@ impl Sha256 {
     fn new() -> Self {
         Self {
             state: [
-                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+                0x5be0cd19,
             ],
             buf: Vec::new(),
             len: 0,
@@ -159,18 +185,25 @@ impl Sha256 {
 
     fn compress(&mut self, block: &[u8]) {
         const K: [u32; 64] = [
-            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-            0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-            0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-            0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-            0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-            0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-            0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+            0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+            0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+            0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+            0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+            0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+            0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+            0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+            0xc67178f2,
         ];
         let mut w = [0u32; 64];
         for i in 0..16 {
-            w[i] = u32::from_be_bytes([block[i * 4], block[i * 4 + 1], block[i * 4 + 2], block[i * 4 + 3]]);
+            w[i] = u32::from_be_bytes([
+                block[i * 4],
+                block[i * 4 + 1],
+                block[i * 4 + 2],
+                block[i * 4 + 3],
+            ]);
         }
         for i in 16..64 {
             let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
@@ -236,7 +269,11 @@ impl Sha256 {
 
 fn extract(archive: &Path, dest: &Path) -> Result<()> {
     std::fs::create_dir_all(dest)?;
-    let name = archive.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+    let name = archive
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_lowercase();
     if name.ends_with(".zip") {
         let file = std::fs::File::open(archive)?;
         let mut zip = zip::ZipArchive::new(file)?;
@@ -273,14 +310,20 @@ fn find_binary(dir: &Path, key: &str) -> Option<PathBuf> {
     };
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&d) else { continue };
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
         for e in entries.flatten() {
             let p = e.path();
             if p.is_dir() {
                 stack.push(p);
                 continue;
             }
-            let name = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+            let name = p
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_lowercase();
             let stem = name.trim_end_matches(".exe");
             if stem == want {
                 return Some(p);
@@ -297,9 +340,13 @@ pub fn install(key: &str, logs: &Logs) -> Result<PathBuf> {
         .find(|e| e.key == key)
         .ok_or_else(|| anyhow!("unknown engine {}", key))?;
 
-    let api = format!("https://api.github.com/repos/{}/releases/latest", engine.repo);
+    let api = format!(
+        "https://api.github.com/repos/{}/releases/latest",
+        engine.repo
+    );
     log(logs, format!("checking {} releases", engine.repo));
-    let release: Release = serde_json::from_str(&get_text(&api)?).context("parsing GitHub release")?;
+    let release: Release =
+        serde_json::from_str(&get_text(&api)?).context("parsing GitHub release")?;
     let asset = pick_asset(key, &release.assets).ok_or_else(|| {
         anyhow!(
             "no asset for this platform in {} {} (arch {})",
@@ -308,7 +355,10 @@ pub fn install(key: &str, logs: &Logs) -> Result<PathBuf> {
             std::env::consts::ARCH
         )
     })?;
-    log(logs, format!("{} {} -> {}", engine.repo, release.tag_name, asset.name));
+    log(
+        logs,
+        format!("{} {} -> {}", engine.repo, release.tag_name, asset.name),
+    );
 
     let dir = engine_dir().join(key);
     std::fs::create_dir_all(&dir)?;
@@ -316,7 +366,10 @@ pub fn install(key: &str, logs: &Logs) -> Result<PathBuf> {
     download(&asset.browser_download_url, &archive).context("downloading asset")?;
 
     // Verify the checksum when the release publishes one.
-    let sums_url = format!("https://github.com/{}/releases/download/{}/checksums.txt", engine.repo, release.tag_name);
+    let sums_url = format!(
+        "https://github.com/{}/releases/download/{}/checksums.txt",
+        engine.repo, release.tag_name
+    );
     if let Ok(text) = get_text(&sums_url) {
         if let Some(expected) = text
             .lines()
@@ -335,7 +388,8 @@ pub fn install(key: &str, logs: &Logs) -> Result<PathBuf> {
     }
 
     extract(&archive, &dir).context("unpacking archive")?;
-    let binary = find_binary(&dir, key).ok_or_else(|| anyhow!("binary not found in the archive"))?;
+    let binary =
+        find_binary(&dir, key).ok_or_else(|| anyhow!("binary not found in the archive"))?;
 
     #[cfg(unix)]
     {

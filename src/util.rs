@@ -9,9 +9,16 @@ pub fn new_logs() -> Logs {
 }
 
 pub fn clock() -> String {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     let secs = now.as_secs() % 86400;
-    format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
+    format!(
+        "{:02}:{:02}:{:02}",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    )
 }
 
 pub fn log(logs: &Logs, msg: impl Into<String>) {
@@ -26,14 +33,25 @@ pub fn log(logs: &Logs, msg: impl Into<String>) {
 pub fn app_log(msg: &str) {
     use std::io::Write;
     let path = std::env::temp_dir().join("kubevpn-app.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         let _ = writeln!(f, "{} {}", clock(), msg);
     }
 }
 
 /// Honor the usual proxy environment variables for outbound HTTP requests.
 pub fn proxy_from_env() -> Option<String> {
-    for key in ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy"] {
+    for key in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+    ] {
         if let Ok(v) = std::env::var(key) {
             let v = v.trim();
             if !v.is_empty() {
@@ -72,7 +90,7 @@ pub fn strip_ansi(s: &str) -> String {
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\u{1b}' {
-            while let Some(n) = chars.next() {
+            for n in chars.by_ref() {
                 if n.is_ascii_alphabetic() {
                     break;
                 }

@@ -132,7 +132,18 @@ async fn relay(mut a: TcpStream, mut b: TcpStream, stats: Arc<Stats>) -> Result<
 }
 
 fn socks_reply(ok: bool) -> [u8; 10] {
-    [0x05, if ok { 0x00 } else { 0x01 }, 0x00, 0x01, 0, 0, 0, 0, 0, 0]
+    [
+        0x05,
+        if ok { 0x00 } else { 0x01 },
+        0x00,
+        0x01,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ]
 }
 
 async fn handle_socks(
@@ -184,11 +195,22 @@ async fn handle_socks(
     let port = u16::from_be_bytes(pb);
 
     let decision = routes.read().unwrap().pick(&host);
-    app_log(&format!("socks5 {}:{} -> {}", host, port, describe(decision)));
-    log(&logs, format!("socks {}:{} -> {}", host, port, describe(decision)));
+    app_log(&format!(
+        "socks5 {}:{} -> {}",
+        host,
+        port,
+        describe(decision)
+    ));
+    log(
+        &logs,
+        format!("socks {}:{} -> {}", host, port, describe(decision)),
+    );
     if decision == Decision::Blocked {
         s.write_all(&socks_reply(false)).await?;
-        log(&logs, format!("blocked {}:{} (target profile is not running)", host, port));
+        log(
+            &logs,
+            format!("blocked {}:{} (target profile is not running)", host, port),
+        );
         return Ok(());
     }
     let up = match decision {
@@ -211,10 +233,17 @@ async fn handle_socks(
 
 fn split_host_port(s: &str) -> Result<(String, u16)> {
     if let Some(rest) = s.strip_prefix('[') {
-        let (host, tail) = rest.split_once(']').ok_or_else(|| anyhow!("bad ipv6 target"))?;
-        return Ok((host.to_string(), tail.trim_start_matches(':').parse::<u16>()?));
+        let (host, tail) = rest
+            .split_once(']')
+            .ok_or_else(|| anyhow!("bad ipv6 target"))?;
+        return Ok((
+            host.to_string(),
+            tail.trim_start_matches(':').parse::<u16>()?,
+        ));
     }
-    let (host, port) = s.rsplit_once(':').ok_or_else(|| anyhow!("no port in {}", s))?;
+    let (host, port) = s
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow!("no port in {}", s))?;
     Ok((host.to_string(), port.parse::<u16>()?))
 }
 
@@ -248,11 +277,23 @@ async fn handle_http(
     if method.eq_ignore_ascii_case("CONNECT") {
         let (host, port) = split_host_port(&target)?;
         let decision = routes.read().unwrap().pick(&host);
-        app_log(&format!("http-connect {}:{} -> {}", host, port, describe(decision)));
-        log(&logs, format!("http CONNECT {}:{} -> {}", host, port, describe(decision)));
+        app_log(&format!(
+            "http-connect {}:{} -> {}",
+            host,
+            port,
+            describe(decision)
+        ));
+        log(
+            &logs,
+            format!("http CONNECT {}:{} -> {}", host, port, describe(decision)),
+        );
         if decision == Decision::Blocked {
-            s.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n").await?;
-            log(&logs, format!("blocked {}:{} (target profile is not running)", host, port));
+            s.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                .await?;
+            log(
+                &logs,
+                format!("blocked {}:{} (target profile is not running)", host, port),
+            );
             return Ok(());
         }
         let up = match decision {
@@ -261,12 +302,16 @@ async fn handle_http(
         };
         match connect_via(&host, port, up).await {
             Ok(remote) => {
-                s.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
+                s.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .await?;
                 relay(s, remote, stats).await
             }
             Err(e) => {
                 s.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await?;
-                log(&logs, format!("http CONNECT {}:{} failed: {}", host, port, e));
+                log(
+                    &logs,
+                    format!("http CONNECT {}:{} failed: {}", host, port, e),
+                );
                 Err(e)
             }
         }
@@ -283,11 +328,30 @@ async fn handle_http(
             None => (authority.to_string(), 80u16),
         };
         let decision = routes.read().unwrap().pick(&host);
-        app_log(&format!("http {} {}:{} -> {}", method, host, port, describe(decision)));
-        log(&logs, format!("http {} {}:{} -> {}", method, host, port, describe(decision)));
+        app_log(&format!(
+            "http {} {}:{} -> {}",
+            method,
+            host,
+            port,
+            describe(decision)
+        ));
+        log(
+            &logs,
+            format!(
+                "http {} {}:{} -> {}",
+                method,
+                host,
+                port,
+                describe(decision)
+            ),
+        );
         if decision == Decision::Blocked {
-            s.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n").await?;
-            log(&logs, format!("blocked {}:{} (target profile is not running)", host, port));
+            s.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                .await?;
+            log(
+                &logs,
+                format!("blocked {}:{} (target profile is not running)", host, port),
+            );
             return Ok(());
         }
         let up = match decision {
@@ -318,7 +382,10 @@ pub fn start(
     stop: Arc<AtomicBool>,
 ) {
     std::thread::spawn(move || {
-        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
             Ok(rt) => rt,
             Err(e) => {
                 log(&logs, format!("runtime error: {}", e));
@@ -382,4 +449,69 @@ pub fn start(
         });
         alive.store(false, Ordering::SeqCst);
     });
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn table(
+        rules: Vec<(&str, Option<u16>)>,
+        default: Option<u16>,
+        configured: bool,
+        fail_closed: bool,
+    ) -> Routes {
+        Routes {
+            rules: rules.into_iter().map(|(s, p)| (s.to_string(), p)).collect(),
+            default,
+            default_configured: configured,
+            fail_closed,
+        }
+    }
+
+    #[test]
+    fn matches_exact_and_subdomain() {
+        let r = table(vec![("example.com", Some(15001))], None, false, false);
+        assert_eq!(r.pick("example.com"), Decision::Via(15001));
+        assert_eq!(r.pick("api.example.com"), Decision::Via(15001));
+        assert_eq!(r.pick("EXAMPLE.COM"), Decision::Via(15001));
+    }
+
+    #[test]
+    fn does_not_match_lookalike_domain() {
+        let r = table(vec![("example.com", Some(15001))], None, false, false);
+        assert_eq!(r.pick("notexample.com"), Decision::Direct);
+        assert_eq!(r.pick("example.com.evil.net"), Decision::Direct);
+    }
+
+    #[test]
+    fn falls_back_to_direct_when_profile_is_down() {
+        let r = table(vec![("example.com", None)], None, false, false);
+        assert_eq!(r.pick("example.com"), Decision::Direct);
+    }
+
+    #[test]
+    fn blocks_when_fail_closed_and_profile_is_down() {
+        let r = table(vec![("example.com", None)], None, false, true);
+        assert_eq!(r.pick("example.com"), Decision::Blocked);
+    }
+
+    #[test]
+    fn default_route_applies_to_unknown_hosts() {
+        let r = table(vec![], Some(15002), true, false);
+        assert_eq!(r.pick("anything.test"), Decision::Via(15002));
+    }
+
+    #[test]
+    fn default_down_respects_fail_closed() {
+        let open = table(vec![], None, true, false);
+        assert_eq!(open.pick("anything.test"), Decision::Direct);
+        let closed = table(vec![], None, true, true);
+        assert_eq!(closed.pick("anything.test"), Decision::Blocked);
+    }
+
+    #[test]
+    fn no_default_configured_is_always_direct() {
+        let r = table(vec![], None, false, true);
+        assert_eq!(r.pick("anything.test"), Decision::Direct);
+    }
 }

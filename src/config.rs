@@ -83,7 +83,10 @@ pub fn parse_listen(input: &str) -> Option<String> {
     } else {
         t.to_string()
     };
-    candidate.parse::<std::net::SocketAddr>().ok().map(|a| a.to_string())
+    candidate
+        .parse::<std::net::SocketAddr>()
+        .ok()
+        .map(|a| a.to_string())
 }
 
 pub fn config_path() -> PathBuf {
@@ -144,5 +147,58 @@ pub fn detect_kind(text: &str) -> Option<&'static str> {
         Some("awg")
     } else {
         None
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_amneziawg_ini() {
+        let text = "[Interface]\nPrivateKey = x\n[Peer]\nPublicKey = y\n";
+        assert_eq!(detect_kind(text), Some("awg"));
+    }
+
+    #[test]
+    fn detects_xray_by_protocol() {
+        let text = r#"{"outbounds":[{"protocol":"vless","tag":"p"}]}"#;
+        assert_eq!(detect_kind(text), Some("xray"));
+    }
+
+    #[test]
+    fn detects_singbox_by_type() {
+        let text = r#"{"outbounds":[{"type":"vless","tag":"p"}]}"#;
+        assert_eq!(detect_kind(text), Some("singbox"));
+    }
+
+    #[test]
+    fn detects_subscription_array() {
+        let text = r#"[{"outbounds":[{"protocol":"vless"}]},{"outbounds":[{"protocol":"vmess"}]}]"#;
+        assert_eq!(detect_kind(text), Some("xray"));
+    }
+
+    #[test]
+    fn rejects_unknown_text() {
+        assert_eq!(detect_kind("hello"), None);
+    }
+
+    #[test]
+    fn parses_bare_port() {
+        assert_eq!(parse_listen("3999"), Some("127.0.0.1:3999".to_string()));
+    }
+
+    #[test]
+    fn parses_host_and_port() {
+        assert_eq!(
+            parse_listen(" 0.0.0.0:9090 "),
+            Some("0.0.0.0:9090".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_garbage_listen() {
+        assert_eq!(parse_listen("nope"), None);
+        assert_eq!(parse_listen("127.0.0.1:99999"), None);
+        assert_eq!(parse_listen(""), None);
     }
 }
