@@ -27,6 +27,8 @@ client (browser, kubectl, curl)
   - Xray-compatible JSON (including REALITY and `finalmask` if your build supports it)
   - sing-box JSON
 - Live reconfiguration: adding, enabling or removing a profile takes effect without a restart.
+- The mixed port speaks SOCKS5 (CONNECT and UDP ASSOCIATE), SOCKS4 and HTTP (CONNECT plus absolute
+  requests), so applications that need UDP — voice chat, games, QUIC — can be pointed at it too.
 - The listening address is editable in the window: changing it restarts only the listener, tunnels keep
   running. It can also be overridden at launch with `--listen`.
 - Tray icon with a menu (show window / start / stop / quit). Closing the window hides it to the tray
