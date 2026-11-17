@@ -36,6 +36,10 @@ client (browser, kubectl, curl)
 - Per-profile status in the list, a `restart` button, and automatic restart 5 seconds after a sidecar
   exits unexpectedly.
 - Duplicate configs are skipped on import, so re-importing a subscription does not multiply profiles.
+- Subscriptions are first-class: a URL becomes one entry that owns its profiles, with a `refresh`
+  button. Refreshing reconciles the list — configs that appeared are added, changed ones are updated in
+  place, and profiles that vanished from the server are removed together with the rules pointing at them.
+  Matching goes by the `remarks` name first, then by identical config text, then by position.
 - A warning appears when a route (or the default route) points at a profile that is not running.
 - Choose what happens in that case: fall back to a direct connection (default) or refuse the
   connection. The checkbox `block traffic when the target profile is down` switches to fail closed,
@@ -181,6 +185,7 @@ A diagnostic switch `KUBEVPN_TEST_TRAY=1` hides the window after 6 seconds and s
 | `profiles[]` | `id`, `name`, `kind` (`awg` / `xray` / `singbox`), `text` (the raw config), `port` (local SOCKS port the engine listens on), `enabled` |
 | `rules[]` | `suffix` + `profile` id |
 | `default_profile` | profile id for everything that matches no rule, `null` means direct |
+| `subscriptions` | remote lists: `id`, `name`, `url`, the `profiles` they own, `last_refresh` |
 | `fail_closed` | `false` (default): a rule whose target profile is down falls back to direct; `true`: such traffic is refused |
 | `minimize_to_tray` | closing the window keeps the app running in the tray |
 

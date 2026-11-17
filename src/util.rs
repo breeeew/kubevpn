@@ -8,6 +8,25 @@ pub fn new_logs() -> Logs {
     Arc::new(Mutex::new(VecDeque::new()))
 }
 
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Human readable age of a timestamp: "just now", "5 min ago", "3 h ago", "2 d ago".
+pub fn ago(unix_secs: u64) -> String {
+    let now = now_secs();
+    let diff = now.saturating_sub(unix_secs);
+    match diff {
+        0..=59 => "just now".to_string(),
+        60..=3599 => format!("{} min ago", diff / 60),
+        3600..=86399 => format!("{} h ago", diff / 3600),
+        _ => format!("{} d ago", diff / 86400),
+    }
+}
+
 pub fn clock() -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)

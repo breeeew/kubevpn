@@ -13,6 +13,10 @@ pub enum TaskResult {
         key: String,
         result: Result<std::path::PathBuf, String>,
     },
+    Refreshed {
+        id: String,
+        result: Result<Vec<crate::subs::Item>, String>,
+    },
 }
 
 /// Runs the slow parts (waiting for a sidecar port, downloading an engine) off the UI thread.
@@ -40,6 +44,16 @@ impl Tasks {
         std::thread::spawn(move || {
             let result = crate::install::install(&key, &logs).map_err(|e| e.to_string());
             let _ = tx.send(TaskResult::Installed { key, result });
+        });
+    }
+
+    pub fn refresh(&self, id: String, url: String, logs: Logs) {
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = crate::subs::fetch(&url, &logs)
+                .and_then(|body| crate::subs::parse(&body))
+                .map_err(|e| e.to_string());
+            let _ = tx.send(TaskResult::Refreshed { id, result });
         });
     }
 

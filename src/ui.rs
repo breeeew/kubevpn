@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,9 +10,10 @@ use anyhow::Result;
 use crate::config::{self, AppConfig, Profile, Rule};
 use crate::engines;
 use crate::proxy::{self, Routes, Stats};
+use crate::subs;
 use crate::tasks::{TaskResult, Tasks};
 use crate::tray::{Tray, TrayAction};
-use crate::util::{app_log, human, log, new_logs, proxy_from_env, Logs};
+use crate::util::{app_log, human, log, new_logs, Logs};
 
 pub struct App {
     cfg: AppConfig,
@@ -22,6 +23,7 @@ pub struct App {
     stop: Arc<AtomicBool>,
     children: HashMap<String, Child>,
     profile_status: HashMap<String, String>,
+    refresh_pending: HashSet<String>,
     restart_at: HashMap<String, Instant>,
     tasks: Tasks,
     tray: Option<Tray>,
@@ -63,6 +65,7 @@ impl App {
             stop: Arc::new(AtomicBool::new(false)),
             children: HashMap::new(),
             profile_status: HashMap::new(),
+            refresh_pending: HashSet::new(),
             restart_at: HashMap::new(),
             tasks: Tasks::new(),
             tray: {
@@ -178,6 +181,7 @@ impl App {
             text,
             port,
             enabled: true,
+            subscription: None,
         });
         self.status = format!("imported {} as {}", origin, id);
         config::save(&self.cfg);
@@ -189,38 +193,222 @@ impl App {
         true
     }
 
-    fn fetch_url(&self, url: &str) -> Result<String> {
-        let mut builder = ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(30))
-            .user_agent("v2rayNG/1.9.16");
-        if let Some(p) = proxy_from_env() {
-            match ureq::Proxy::new(&p) {
-                Ok(proxy) => builder = builder.proxy(proxy),
-                Err(e) => app_log(&format!("ignoring proxy {}: {}", p, e)),
-            }
-        }
-        let agent = builder.build();
-        let body = agent.get(url).call()?.into_string()?;
-        Ok(body)
-    }
-
     fn import_from_url(&mut self, url: &str) {
-        if url.trim().is_empty() {
+        let url = url.trim().to_string();
+        if url.is_empty() {
             self.status = "url is empty".into();
             return;
         }
-        app_log(&format!("import url: {}", url.trim()));
-        match self.fetch_url(url.trim()) {
-            Ok(body) => {
-                app_log(&format!("import url: fetched {} bytes", body.len()));
-                self.import_payload(body, "subscription");
-                app_log(&format!("import url: {}", self.status));
-            }
-            Err(e) => {
-                app_log(&format!("import url failed: {}", e));
-                self.status = e.to_string();
+        if let Some(existing) = self.cfg.subscriptions.iter().find(|s| s.url == url) {
+            let id = existing.id.clone();
+            self.refresh_subscription(&id);
+            return;
+        }
+        let mut n = self.cfg.subscriptions.len() + 1;
+        let mut id = format!("s{}", n);
+        while self.cfg.subscriptions.iter().any(|s| s.id == id) {
+            n += 1;
+            id = format!("s{}", n);
+        }
+        let name = url
+            .split("//")
+            .nth(1)
+            .and_then(|rest| rest.split('/').next())
+            .filter(|h| !h.is_empty())
+            .map(|h| h.to_string())
+            .unwrap_or_else(|| format!("subscription {}", n));
+        app_log(&format!("subscription {}: add {}", id, url));
+        self.cfg.subscriptions.push(config::Subscription {
+            id: id.clone(),
+            name,
+            url: url.clone(),
+            profiles: Vec::new(),
+            last_refresh: None,
+            last_error: None,
+        });
+        config::save(&self.cfg);
+        self.import_url.clear();
+        self.refresh_subscription(&id);
+    }
+
+    /// Fetches the subscription in the background; the result is applied in apply_subscription.
+    fn refresh_subscription(&mut self, id: &str) {
+        let url = match self.cfg.subscriptions.iter().find(|s| s.id == id) {
+            Some(s) => s.url.clone(),
+            None => return,
+        };
+        self.refresh_pending.insert(id.to_string());
+        self.status = format!("refreshing {}...", id);
+        self.tasks.refresh(id.to_string(), url, self.logs.clone());
+    }
+
+    /// Reconciles a fetched subscription with the stored profiles: new configs are added,
+    /// changed ones are updated in place, and profiles that disappeared are removed.
+    fn apply_subscription(&mut self, id: &str, items: Vec<subs::Item>) {
+        let existing: Vec<String> = self
+            .cfg
+            .profiles
+            .iter()
+            .filter(|p| p.subscription.as_deref() == Some(id))
+            .map(|p| p.id.clone())
+            .collect();
+        let mut assigned: Vec<Option<String>> = vec![None; items.len()];
+        let mut used: HashSet<String> = HashSet::new();
+
+        // 1) match by name, which subscriptions expose as "remarks"
+        for (i, item) in items.iter().enumerate() {
+            if let Some(name) = &item.name {
+                if let Some(p) = self.cfg.profiles.iter().find(|p| {
+                    p.name == *name
+                        && (p.subscription.as_deref() == Some(id) || p.subscription.is_none())
+                        && !used.contains(&p.id)
+                }) {
+                    assigned[i] = Some(p.id.clone());
+                    used.insert(p.id.clone());
+                }
             }
         }
+        // 2) adopt a standalone profile that carries exactly the same config text
+        for (i, item) in items.iter().enumerate() {
+            if assigned[i].is_some() {
+                continue;
+            }
+            if let Some(p) = self
+                .cfg
+                .profiles
+                .iter()
+                .find(|p| p.text.trim() == item.text.trim() && !used.contains(&p.id))
+            {
+                assigned[i] = Some(p.id.clone());
+                used.insert(p.id.clone());
+            }
+        }
+        // 3) fall back to the previous position in the list
+        for (i, slot) in assigned.iter_mut().enumerate() {
+            if slot.is_some() {
+                continue;
+            }
+            if let Some(old) = existing.get(i) {
+                if !used.contains(old) {
+                    *slot = Some(old.clone());
+                    used.insert(old.clone());
+                }
+            }
+        }
+
+        let mut added = 0;
+        let mut updated = 0;
+        let mut fresh: Vec<String> = Vec::new();
+        for (i, item) in items.into_iter().enumerate() {
+            let kind = config::detect_kind(&item.text)
+                .unwrap_or("xray")
+                .to_string();
+            match assigned[i].clone() {
+                Some(pid) => {
+                    if let Some(p) = self.cfg.profiles.iter_mut().find(|p| p.id == pid) {
+                        let same_text = p.text == item.text;
+                        if let Some(name) = item.name.clone() {
+                            p.name = name;
+                        }
+                        p.text = item.text;
+                        p.kind = kind;
+                        p.subscription = Some(id.to_string());
+                        if !same_text {
+                            updated += 1;
+                        }
+                    }
+                }
+                None => {
+                    let pid = self.next_id();
+                    let port = self.next_port();
+                    let name = item
+                        .name
+                        .unwrap_or_else(|| format!("profile-{}", pid.trim_start_matches('p')));
+                    self.cfg.profiles.push(Profile {
+                        id: pid.clone(),
+                        name,
+                        kind,
+                        text: item.text,
+                        port,
+                        enabled: true,
+                        subscription: Some(id.to_string()),
+                    });
+                    fresh.push(pid);
+                    added += 1;
+                }
+            }
+        }
+
+        let mut keep: HashSet<String> = assigned.into_iter().flatten().collect();
+        for pid in &fresh {
+            keep.insert(pid.clone());
+        }
+        let before = self.cfg.profiles.len();
+        self.cfg
+            .profiles
+            .retain(|p| p.subscription.as_deref() != Some(id) || keep.contains(&p.id));
+        let removed = before - self.cfg.profiles.len();
+
+        let alive: HashSet<String> = self.cfg.profiles.iter().map(|p| p.id.clone()).collect();
+        self.cfg.rules.retain(|r| alive.contains(&r.profile));
+        if let Some(dp) = self.cfg.default_profile.clone() {
+            if !alive.contains(&dp) {
+                self.cfg.default_profile = None;
+            }
+        }
+
+        let order: Vec<String> = self
+            .cfg
+            .profiles
+            .iter()
+            .filter(|p| p.subscription.as_deref() == Some(id))
+            .map(|p| p.id.clone())
+            .collect();
+        if let Some(s) = self.cfg.subscriptions.iter_mut().find(|s| s.id == id) {
+            s.profiles = order;
+            s.last_refresh = Some(crate::util::now_secs());
+            s.last_error = None;
+        }
+        config::save(&self.cfg);
+
+        for pid in &fresh {
+            let enabled = self.profile_by_id(pid).map(|p| p.enabled).unwrap_or(false);
+            if self.running && enabled {
+                self.spawn_by_id(pid);
+            }
+        }
+        self.refresh_routes();
+        self.status = format!(
+            "{}: {} new, {} updated, {} removed",
+            id, added, updated, removed
+        );
+    }
+
+    fn remove_subscription(&mut self, id: &str) {
+        let ids: Vec<String> = self
+            .cfg
+            .profiles
+            .iter()
+            .filter(|p| p.subscription.as_deref() == Some(id))
+            .map(|p| p.id.clone())
+            .collect();
+        for pid in &ids {
+            self.stop_by_id(pid);
+        }
+        self.cfg
+            .profiles
+            .retain(|p| p.subscription.as_deref() != Some(id));
+        self.cfg.rules.retain(|r| !ids.contains(&r.profile));
+        if let Some(dp) = self.cfg.default_profile.clone() {
+            if ids.contains(&dp) {
+                self.cfg.default_profile = None;
+            }
+        }
+        self.cfg.subscriptions.retain(|s| s.id != id);
+        self.refresh_pending.remove(id);
+        config::save(&self.cfg);
+        self.refresh_routes();
+        self.status = format!("removed subscription {} and {} profiles", id, ids.len());
     }
 
     fn import_clipboard(&mut self) {
@@ -271,6 +459,211 @@ impl App {
         } else {
             self.add_profile(t, origin);
         }
+    }
+
+    fn routes_ui(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new(egui::RichText::new("Routes").strong())
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.add_space(4.0);
+                let ids: Vec<(String, String)> = self
+                    .cfg
+                    .profiles
+                    .iter()
+                    .map(|p| (p.id.clone(), p.name.clone()))
+                    .collect();
+                let mut remove_rule: Option<usize> = None;
+                egui::Grid::new("rules")
+                    .num_columns(3)
+                    .spacing([8.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("domain suffix").strong());
+                        ui.label(egui::RichText::new("profile").strong());
+                        ui.label("");
+                        ui.end_row();
+                        for (i, r) in self.cfg.rules.iter().enumerate() {
+                            ui.label(&r.suffix);
+                            let name = ids
+                                .iter()
+                                .find(|(id, _)| id == &r.profile)
+                                .map(|(_, n)| n.clone())
+                                .unwrap_or_else(|| "?".into());
+                            ui.label(name);
+                            if ui.small_button("x").clicked() {
+                                remove_rule = Some(i);
+                            }
+                            ui.end_row();
+                        }
+                    });
+                if let Some(i) = remove_rule {
+                    self.cfg.rules.remove(i);
+                    config::save(&self.cfg);
+                    self.refresh_routes();
+                }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.new_suffix)
+                            .desired_width(150.0)
+                            .hint_text("example.com"),
+                    );
+                    if self.new_rule_profile.is_empty() {
+                        if let Some((id, _)) = ids.first() {
+                            self.new_rule_profile = id.clone();
+                        }
+                    }
+                    egui::ComboBox::from_id_salt("rule_profile")
+                        .selected_text(
+                            ids.iter()
+                                .find(|(id, _)| id == &self.new_rule_profile)
+                                .map(|(_, n)| n.clone())
+                                .unwrap_or_else(|| "-".into()),
+                        )
+                        .show_ui(ui, |ui| {
+                            for (id, name) in &ids {
+                                ui.selectable_value(
+                                    &mut self.new_rule_profile,
+                                    id.clone(),
+                                    name.as_str(),
+                                );
+                            }
+                        });
+                    if ui.button("Add").clicked() {
+                        let suffix = self.new_suffix.trim().to_string();
+                        if !suffix.is_empty() && !self.new_rule_profile.is_empty() {
+                            self.cfg.rules.push(Rule {
+                                suffix,
+                                profile: self.new_rule_profile.clone(),
+                            });
+                            self.new_suffix.clear();
+                            config::save(&self.cfg);
+                            self.refresh_routes();
+                        }
+                    }
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("everything else:");
+                    let current = self
+                        .cfg
+                        .default_profile
+                        .as_ref()
+                        .and_then(|id| ids.iter().find(|(i, _)| i == id))
+                        .map(|(_, n)| n.clone())
+                        .unwrap_or_else(|| "direct".into());
+                    egui::ComboBox::from_id_salt("default_route")
+                        .selected_text(current)
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_label(self.cfg.default_profile.is_none(), "direct")
+                                .clicked()
+                            {
+                                self.cfg.default_profile = None;
+                                config::save(&self.cfg);
+                                self.refresh_routes();
+                            }
+                            for (id, name) in &ids {
+                                if ui
+                                    .selectable_label(
+                                        self.cfg.default_profile.as_deref() == Some(id.as_str()),
+                                        name.as_str(),
+                                    )
+                                    .clicked()
+                                {
+                                    self.cfg.default_profile = Some(id.clone());
+                                    config::save(&self.cfg);
+                                    self.refresh_routes();
+                                }
+                            }
+                        });
+                });
+            });
+    }
+
+    fn settings_ui(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new(egui::RichText::new("Settings").strong())
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Engine binaries").strong());
+                ui.horizontal(|ui| {
+                    ui.label("awg-wireproxy:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.cfg.binaries.awg).desired_width(220.0),
+                    );
+                    if ui.small_button("install").clicked() {
+                        self.install_engine("awg");
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("xray:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.cfg.binaries.xray)
+                            .desired_width(220.0),
+                    );
+                    if ui.small_button("install").clicked() {
+                        self.install_engine("xray");
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("sing-box:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.cfg.binaries.singbox)
+                            .desired_width(220.0),
+                    );
+                    if ui.small_button("install").clicked() {
+                        self.install_engine("singbox");
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "install pulls the latest GitHub release and verifies its checksum",
+                    )
+                    .weak()
+                    .small(),
+                );
+                ui.add_space(6.0);
+                if ui.button("Save settings").clicked() {
+                    config::save(&self.cfg);
+                    self.status = "settings saved".into();
+                }
+                ui.add_space(6.0);
+                let mut login = self.autostart_login;
+                if ui.checkbox(&mut login, "launch at login").changed() {
+                    self.autostart_login = login;
+                    match set_autostart(login) {
+                        Ok(()) => {
+                            self.status = if login {
+                                "will start at login".into()
+                            } else {
+                                "login autostart off".into()
+                            }
+                        }
+                        Err(e) => self.status = format!("autostart: {}", e),
+                    }
+                }
+                if ui
+                    .checkbox(&mut self.cfg.minimize_to_tray, "minimize to tray on close")
+                    .changed()
+                {
+                    config::save(&self.cfg);
+                }
+                if ui
+                    .checkbox(
+                        &mut self.cfg.fail_closed,
+                        "block traffic when the target profile is down",
+                    )
+                    .changed()
+                {
+                    config::save(&self.cfg);
+                    self.refresh_routes();
+                    self.status = if self.cfg.fail_closed {
+                        "routes to stopped profiles now block traffic".into()
+                    } else {
+                        "routes to stopped profiles now fall back to direct".into()
+                    };
+                }
+            });
     }
 
     fn set_binary(&mut self, key: &str, path: &str) {
@@ -607,6 +1000,25 @@ impl eframe::App for App {
                         log(&self.logs, format!("profile {} failed: {}", id, e));
                     }
                 },
+                TaskResult::Refreshed { id, result } => {
+                    self.refresh_pending.remove(&id);
+                    match result {
+                        Ok(items) => {
+                            let n = items.len();
+                            app_log(&format!("subscription {}: {} configs", id, n));
+                            self.apply_subscription(&id, items);
+                        }
+                        Err(e) => {
+                            log(&self.logs, format!("subscription {} failed: {}", id, e));
+                            if let Some(s) = self.cfg.subscriptions.iter_mut().find(|s| s.id == id)
+                            {
+                                s.last_error = Some(e.clone());
+                            }
+                            config::save(&self.cfg);
+                            self.status = format!("{}: {}", id, e);
+                        }
+                    }
+                }
                 TaskResult::Installed { key, result } => match result {
                     Ok(path) => {
                         let p = path.to_string_lossy().to_string();
@@ -797,310 +1209,260 @@ impl eframe::App for App {
 
         egui::SidePanel::left("left")
             .resizable(true)
-            .default_width(440.0)
+            .default_width(480.0)
             .show(ctx, |ui| {
-                ui.add_space(6.0);
-                ui.heading("Profiles");
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    if ui.button("From clipboard").clicked() {
-                        self.import_clipboard();
-                    }
-                    ui.label("or file:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.import_path)
-                            .desired_width(140.0)
-                            .hint_text("C:\\path\\to\\config"),
-                    );
-                    if ui.button("Import").clicked() {
-                        let p = self.import_path.clone();
-                        self.import_file(&p);
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("or URL:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.import_url)
-                            .desired_width(220.0)
-                            .hint_text("https://sub.example/sub"),
-                    );
-                    if ui.button("Import URL").clicked() {
-                        let u = self.import_url.clone();
-                        self.import_from_url(&u);
-                    }
-                });
-                ui.label(
-                    egui::RichText::new("you can also drop a file into the window")
-                        .weak()
-                        .small(),
-                );
-                ui.add_space(6.0);
-
-                let mut remove: Option<String> = None;
-                let mut restart: Option<String> = None;
-                let mut toggle: Option<(String, bool)> = None;
-                for p in self.cfg.profiles.iter_mut() {
-                    ui.horizontal(|ui| {
-                        if ui.checkbox(&mut p.enabled, "").changed() {
-                            toggle = Some((p.id.clone(), p.enabled));
-                        }
-                        let running = self.children.contains_key(&p.id);
-                        let color = if running {
-                            egui::Color32::from_rgb(120, 220, 120)
-                        } else {
-                            egui::Color32::GRAY
-                        };
-                        ui.colored_label(color, if running { "on" } else { "off" });
-                        ui.label(&p.name);
-                        ui.label(
-                            egui::RichText::new(format!("{} :{}", p.kind, p.port))
-                                .weak()
-                                .small(),
-                        );
-                        if !running {
-                            if let Some(st) = self.profile_status.get(&p.id) {
-                                let short: String = st.chars().take(60).collect();
-                                ui.label(
-                                    egui::RichText::new(short)
-                                        .small()
-                                        .color(egui::Color32::from_rgb(230, 170, 90)),
-                                );
-                            }
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("x").clicked() {
-                                remove = Some(p.id.clone());
-                            }
-                            if ui.small_button("restart").clicked() {
-                                restart = Some(p.id.clone());
-                            }
-                        });
-                    });
-                }
-                if let Some(id) = restart {
-                    if self.running {
-                        self.stop_by_id(&id);
-                        self.spawn_by_id(&id);
-                    } else {
-                        self.status = "press Start first".into();
-                    }
-                }
-                if let Some((id, enabled)) = toggle {
-                    config::save(&self.cfg);
-                    if self.running {
-                        if enabled {
-                            self.spawn_by_id(&id);
-                        } else {
-                            self.stop_by_id(&id);
-                        }
-                    }
-                }
-                if let Some(id) = remove {
-                    self.stop_by_id(&id);
-                    self.cfg.profiles.retain(|p| p.id != id);
-                    self.cfg.rules.retain(|r| r.profile != id);
-                    if self.cfg.default_profile.as_deref() == Some(id.as_str()) {
-                        self.cfg.default_profile = None;
-                    }
-                    config::save(&self.cfg);
-                    self.refresh_routes();
-                }
-
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(6.0);
-                ui.heading("Routes");
-                ui.add_space(4.0);
-                let ids: Vec<(String, String)> = self
-                    .cfg
-                    .profiles
-                    .iter()
-                    .map(|p| (p.id.clone(), p.name.clone()))
-                    .collect();
-                let mut remove_rule: Option<usize> = None;
-                egui::Grid::new("rules")
-                    .num_columns(3)
-                    .spacing([8.0, 6.0])
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.label(egui::RichText::new("domain suffix").strong());
-                        ui.label(egui::RichText::new("profile").strong());
-                        ui.label("");
-                        ui.end_row();
-                        for (i, r) in self.cfg.rules.iter().enumerate() {
-                            ui.label(&r.suffix);
-                            let name = ids
-                                .iter()
-                                .find(|(id, _)| id == &r.profile)
-                                .map(|(_, n)| n.clone())
-                                .unwrap_or_else(|| "?".into());
-                            ui.label(name);
-                            if ui.small_button("x").clicked() {
-                                remove_rule = Some(i);
+                        ui.add_space(8.0);
+                        ui.heading("Tunnels");
+                        ui.label(
+                            egui::RichText::new(
+                                "import a config, drop a file, or subscribe to a URL",
+                            )
+                            .weak()
+                            .small(),
+                        );
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("From clipboard").clicked() {
+                                self.import_clipboard();
                             }
-                            ui.end_row();
-                        }
-                    });
-                if let Some(i) = remove_rule {
-                    self.cfg.rules.remove(i);
-                    config::save(&self.cfg);
-                    self.refresh_routes();
-                }
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.new_suffix)
-                            .desired_width(150.0)
-                            .hint_text("example.com"),
-                    );
-                    if self.new_rule_profile.is_empty() {
-                        if let Some((id, _)) = ids.first() {
-                            self.new_rule_profile = id.clone();
-                        }
-                    }
-                    egui::ComboBox::from_id_salt("rule_profile")
-                        .selected_text(
-                            ids.iter()
-                                .find(|(id, _)| id == &self.new_rule_profile)
-                                .map(|(_, n)| n.clone())
-                                .unwrap_or_else(|| "-".into()),
-                        )
-                        .show_ui(ui, |ui| {
-                            for (id, name) in &ids {
-                                ui.selectable_value(
-                                    &mut self.new_rule_profile,
-                                    id.clone(),
-                                    name.as_str(),
-                                );
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.import_path)
+                                    .desired_width(170.0)
+                                    .hint_text("file path"),
+                            );
+                            if ui.button("File").clicked() {
+                                let p = self.import_path.clone();
+                                self.import_file(&p);
                             }
                         });
-                    if ui.button("Add").clicked() {
-                        let suffix = self.new_suffix.trim().to_string();
-                        if !suffix.is_empty() && !self.new_rule_profile.is_empty() {
-                            self.cfg.rules.push(Rule {
-                                suffix,
-                                profile: self.new_rule_profile.clone(),
-                            });
-                            self.new_suffix.clear();
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.import_url)
+                                    .desired_width(290.0)
+                                    .hint_text("https://sub.example/sub"),
+                            );
+                            if ui.button("Subscribe").clicked() {
+                                let u = self.import_url.clone();
+                                self.import_from_url(&u);
+                            }
+                        });
+
+                        if !self.cfg.subscriptions.is_empty() {
+                            ui.add_space(12.0);
+                            ui.separator();
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new("Subscriptions").strong());
+                            ui.add_space(6.0);
+                            let pending = self.refresh_pending.clone();
+                            let mut refresh: Option<String> = None;
+                            let mut drop_sub: Option<String> = None;
+                            for s in &self.cfg.subscriptions {
+                                egui::Frame::group(ui.style())
+                                    .inner_margin(egui::Margin::same(8.0))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label(egui::RichText::new(&s.name).strong());
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "{} configs",
+                                                    s.profiles.len()
+                                                ))
+                                                .weak()
+                                                .small(),
+                                            );
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    if ui.small_button("x").clicked() {
+                                                        drop_sub = Some(s.id.clone());
+                                                    }
+                                                    let busy = pending.contains(&s.id);
+                                                    let label = if busy {
+                                                        "refreshing..."
+                                                    } else {
+                                                        "refresh"
+                                                    };
+                                                    if ui
+                                                        .add_enabled(
+                                                            !busy,
+                                                            egui::Button::new(label).small(),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        refresh = Some(s.id.clone());
+                                                    }
+                                                },
+                                            );
+                                        });
+                                        ui.label(egui::RichText::new(&s.url).weak().small());
+                                        ui.horizontal(|ui| {
+                                            if let Some(t) = s.last_refresh {
+                                                ui.label(
+                                                    egui::RichText::new(format!(
+                                                        "updated {}",
+                                                        crate::util::ago(t)
+                                                    ))
+                                                    .weak()
+                                                    .small(),
+                                                );
+                                            }
+                                            if let Some(e) = &s.last_error {
+                                                let short: String = e.chars().take(80).collect();
+                                                ui.label(
+                                                    egui::RichText::new(short).small().color(
+                                                        egui::Color32::from_rgb(230, 120, 120),
+                                                    ),
+                                                );
+                                            }
+                                        });
+                                    });
+                                ui.add_space(4.0);
+                            }
+                            if let Some(id) = refresh {
+                                self.refresh_subscription(&id);
+                            }
+                            if let Some(id) = drop_sub {
+                                self.remove_subscription(&id);
+                            }
+                        }
+
+                        ui.add_space(12.0);
+                        ui.separator();
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new("Profiles").strong());
+                        ui.add_space(6.0);
+
+                        let mut groups: Vec<(Option<String>, Vec<usize>)> = Vec::new();
+                        for (i, p) in self.cfg.profiles.iter().enumerate() {
+                            match groups.iter_mut().find(|(k, _)| *k == p.subscription) {
+                                Some((_, v)) => v.push(i),
+                                None => groups.push((p.subscription.clone(), vec![i])),
+                            }
+                        }
+                        groups.sort_by_key(|(k, _)| if k.is_none() { 0 } else { 1 });
+
+                        let mut remove: Option<String> = None;
+                        let mut restart: Option<String> = None;
+                        let mut toggle: Option<(String, bool)> = None;
+
+                        for (key, idxs) in groups {
+                            let header = match &key {
+                                Some(sid) => self
+                                    .cfg
+                                    .subscriptions
+                                    .iter()
+                                    .find(|s| &s.id == sid)
+                                    .map(|s| s.name.clone())
+                                    .unwrap_or_else(|| sid.clone()),
+                                None => "standalone".to_string(),
+                            };
+                            ui.add_space(6.0);
+                            ui.label(
+                                egui::RichText::new(format!("{} ({})", header, idxs.len()))
+                                    .italics()
+                                    .weak()
+                                    .small(),
+                            );
+                            for idx in idxs {
+                                let (id, name, kind, port) = {
+                                    let prof = &self.cfg.profiles[idx];
+                                    (
+                                        prof.id.clone(),
+                                        prof.name.clone(),
+                                        prof.kind.clone(),
+                                        prof.port,
+                                    )
+                                };
+                                let mut on = self.cfg.profiles[idx].enabled;
+                                let running = self.children.contains_key(&id);
+                                ui.horizontal(|ui| {
+                                    if ui.checkbox(&mut on, "").changed() {
+                                        toggle = Some((id.clone(), on));
+                                    }
+                                    let color = if running {
+                                        egui::Color32::from_rgb(120, 220, 120)
+                                    } else {
+                                        egui::Color32::GRAY
+                                    };
+                                    ui.colored_label(
+                                        color,
+                                        egui::RichText::new(if running { "on " } else { "off" })
+                                            .monospace(),
+                                    );
+                                    ui.label(&name);
+                                    ui.label(
+                                        egui::RichText::new(format!("{} :{}", kind, port))
+                                            .weak()
+                                            .small(),
+                                    );
+                                    if !running {
+                                        if let Some(st) = self.profile_status.get(&id) {
+                                            let short: String = st.chars().take(50).collect();
+                                            ui.label(
+                                                egui::RichText::new(short)
+                                                    .small()
+                                                    .color(egui::Color32::from_rgb(230, 170, 90)),
+                                            );
+                                        }
+                                    }
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui.small_button("x").clicked() {
+                                                remove = Some(id.clone());
+                                            }
+                                            if ui.small_button("restart").clicked() {
+                                                restart = Some(id.clone());
+                                            }
+                                        },
+                                    );
+                                });
+                            }
+                        }
+
+                        if let Some(id) = restart {
+                            if self.running {
+                                self.stop_by_id(&id);
+                                self.spawn_by_id(&id);
+                            } else {
+                                self.status = "press Start first".into();
+                            }
+                        }
+                        if let Some((id, enabled)) = toggle {
+                            config::save(&self.cfg);
+                            if self.running {
+                                if enabled {
+                                    self.spawn_by_id(&id);
+                                } else {
+                                    self.stop_by_id(&id);
+                                }
+                            }
+                        }
+                        if let Some(id) = remove {
+                            self.stop_by_id(&id);
+                            self.cfg.profiles.retain(|p| p.id != id);
+                            self.cfg.rules.retain(|r| r.profile != id);
+                            for s in &mut self.cfg.subscriptions {
+                                s.profiles.retain(|pid| pid != &id);
+                            }
+                            if self.cfg.default_profile.as_deref() == Some(id.as_str()) {
+                                self.cfg.default_profile = None;
+                            }
                             config::save(&self.cfg);
                             self.refresh_routes();
                         }
-                    }
-                });
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label("everything else:");
-                    let current = self
-                        .cfg
-                        .default_profile
-                        .as_ref()
-                        .and_then(|id| ids.iter().find(|(i, _)| i == id))
-                        .map(|(_, n)| n.clone())
-                        .unwrap_or_else(|| "direct".into());
-                    egui::ComboBox::from_id_salt("default_route")
-                        .selected_text(current)
-                        .show_ui(ui, |ui| {
-                            if ui
-                                .selectable_label(self.cfg.default_profile.is_none(), "direct")
-                                .clicked()
-                            {
-                                self.cfg.default_profile = None;
-                                config::save(&self.cfg);
-                                self.refresh_routes();
-                            }
-                            for (id, name) in &ids {
-                                if ui
-                                    .selectable_label(
-                                        self.cfg.default_profile.as_deref() == Some(id.as_str()),
-                                        name.as_str(),
-                                    )
-                                    .clicked()
-                                {
-                                    self.cfg.default_profile = Some(id.clone());
-                                    config::save(&self.cfg);
-                                    self.refresh_routes();
-                                }
-                            }
-                        });
-                });
 
-                ui.add_space(10.0);
-                ui.separator();
-                ui.label(egui::RichText::new("Engine binaries").strong());
-                ui.horizontal(|ui| {
-                    ui.label("awg-wireproxy:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.cfg.binaries.awg).desired_width(220.0),
-                    );
-                    if ui.small_button("install").clicked() {
-                        self.install_engine("awg");
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("xray:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.cfg.binaries.xray)
-                            .desired_width(220.0),
-                    );
-                    if ui.small_button("install").clicked() {
-                        self.install_engine("xray");
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("sing-box:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.cfg.binaries.singbox)
-                            .desired_width(220.0),
-                    );
-                    if ui.small_button("install").clicked() {
-                        self.install_engine("singbox");
-                    }
-                });
-                ui.label(
-                    egui::RichText::new(
-                        "install pulls the latest GitHub release and verifies its checksum",
-                    )
-                    .weak()
-                    .small(),
-                );
-                if ui.button("Save settings").clicked() {
-                    config::save(&self.cfg);
-                    self.status = "settings saved".into();
-                }
-                ui.add_space(6.0);
-                let mut login = self.autostart_login;
-                if ui.checkbox(&mut login, "launch at login").changed() {
-                    self.autostart_login = login;
-                    match set_autostart(login) {
-                        Ok(()) => {
-                            self.status = if login {
-                                "will start at login".into()
-                            } else {
-                                "login autostart off".into()
-                            }
-                        }
-                        Err(e) => self.status = format!("autostart: {}", e),
-                    }
-                }
-                if ui
-                    .checkbox(&mut self.cfg.minimize_to_tray, "minimize to tray on close")
-                    .changed()
-                {
-                    config::save(&self.cfg);
-                }
-                if ui
-                    .checkbox(
-                        &mut self.cfg.fail_closed,
-                        "block traffic when the target profile is down",
-                    )
-                    .changed()
-                {
-                    config::save(&self.cfg);
-                    self.refresh_routes();
-                    self.status = if self.cfg.fail_closed {
-                        "routes to stopped profiles now block traffic".into()
-                    } else {
-                        "routes to stopped profiles now fall back to direct".into()
-                    };
-                }
+                        ui.add_space(12.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+                        self.routes_ui(ui);
+                        ui.add_space(8.0);
+                        self.settings_ui(ui);
+                        ui.add_space(12.0);
+                    });
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {

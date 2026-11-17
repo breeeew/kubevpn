@@ -28,6 +28,26 @@ pub struct Profile {
     pub port: u16,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Subscription this profile came from, if any.
+    #[serde(default)]
+    pub subscription: Option<String>,
+}
+
+/// A remote list of configs that can be refreshed; its profiles live in AppConfig::profiles.
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub struct Subscription {
+    pub id: String,
+    pub name: String,
+    pub url: String,
+    /// Profile ids that belong to this subscription, in server order.
+    #[serde(default)]
+    pub profiles: Vec<String>,
+    /// Unix time of the last successful refresh.
+    #[serde(default)]
+    pub last_refresh: Option<u64>,
+    /// Last error, cleared by a successful refresh.
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -55,6 +75,8 @@ pub struct AppConfig {
     /// false - fall back to a direct connection, true - refuse the connection.
     #[serde(default)]
     pub fail_closed: bool,
+    #[serde(default)]
+    pub subscriptions: Vec<Subscription>,
 }
 
 impl Default for AppConfig {
@@ -68,6 +90,7 @@ impl Default for AppConfig {
             default_profile: None,
             minimize_to_tray: true,
             fail_closed: false,
+            subscriptions: Vec::new(),
         }
     }
 }

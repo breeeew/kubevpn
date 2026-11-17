@@ -4,6 +4,7 @@ mod config;
 mod engines;
 mod install;
 mod proxy;
+mod subs;
 mod tasks;
 mod tray;
 mod ui;
