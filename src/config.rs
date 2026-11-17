@@ -64,6 +64,20 @@ impl Default for AppConfig {
     }
 }
 
+/// Accepts "127.0.0.1:9090", "0.0.0.0:9090" or a bare port number.
+pub fn parse_listen(input: &str) -> Option<String> {
+    let t = input.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let candidate = if t.chars().all(|c| c.is_ascii_digit()) {
+        format!("127.0.0.1:{}", t)
+    } else {
+        t.to_string()
+    };
+    candidate.parse::<std::net::SocketAddr>().ok().map(|a| a.to_string())
+}
+
 pub fn config_path() -> PathBuf {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {

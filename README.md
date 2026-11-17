@@ -27,6 +27,8 @@ client (browser, kubectl, curl)
   - Xray-compatible JSON (including REALITY and `finalmask` if your build supports it)
   - sing-box JSON
 - Live reconfiguration: adding, enabling or removing a profile takes effect without a restart.
+- The listening address is editable in the window: changing it restarts only the listener, tunnels keep
+  running. It can also be overridden at launch with `--listen`.
 - Routes pointing at a stopped profile are skipped, so traffic falls back to direct instead of
   hitting a dead port.
 - Per-request log in the window and in `%TEMP%\kubevpn-app.log`; each sidecar writes its own log
@@ -49,13 +51,22 @@ cargo build --release
 The binary lands in `target/release/kubevpn.exe` (or `target/<triple>/release/`).
 Put `config.json` next to the binary, or run it from the directory that contains the config.
 
+## Command line
+
+```text
+kubevpn.exe [--listen <addr>]
+```
+
+`--listen` accepts `host:port` or a bare port number. It overrides the value from `config.json` for
+this run only; use the `Apply` button in the window to persist a new address.
+
 ## Configuration
 
 `config.json` is written by the app. Copy `config.example.json` and fill in your own values.
 
 | field | meaning |
 |---|---|
-| `listen` | address of the mixed port, for example `127.0.0.1:3080` |
+| `listen` | address of the mixed port, for example `127.0.0.1:3080`; editable in the window |
 | `autostart` | start the tunnels and the listener immediately on launch |
 | `binaries.awg` / `binaries.xray` / `binaries.singbox` | paths to engine executables |
 | `profiles[]` | `id`, `name`, `kind` (`awg` / `xray` / `singbox`), `text` (the raw config), `port` (local SOCKS port the engine listens on), `enabled` |

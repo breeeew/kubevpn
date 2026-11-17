@@ -24,6 +24,7 @@ pub struct App {
     routes: Arc<RwLock<Routes>>,
     running: bool,
     started_at: Option<Instant>,
+    listen_edit: String,
     import_path: String,
     import_url: String,
     new_suffix: String,
@@ -32,9 +33,13 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, listen_override: Option<String>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
-        let cfg = config::load();
+        let mut cfg = config::load();
+        if let Some(addr) = listen_override.and_then(|a| config::parse_listen(&a)) {
+            cfg.listen = addr;
+        }
+        let cfg_listen = cfg.listen.clone();
         app_log(&format!(
             "config: {} profiles, autostart={}, listen={}",
             cfg.profiles.len(),
@@ -51,6 +56,7 @@ impl App {
             routes: Arc::new(RwLock::new(Routes::default())),
             running: false,
             started_at: None,
+            listen_edit: cfg_listen.clone(),
             import_path: String::new(),
             import_url: String::new(),
             new_suffix: String::new(),
@@ -283,6 +289,12 @@ impl App {
             self.status = "no tunnels started".into();
         }
         self.refresh_routes();
+        self.start_listener();
+    }
+
+    fn start_listener(&mut self) {
+        self.stop = Arc::new(AtomicBool::new(false));
+        self.alive = Arc::new(AtomicBool::new(true));
         proxy::start(
             self.cfg.listen.clone(),
             self.routes.clone(),
@@ -295,8 +307,35 @@ impl App {
         self.started_at = Some(Instant::now());
     }
 
-    fn stop(&mut self) {
+    fn stop_listener(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while self.alive.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        self.running = false;
+    }
+
+    fn apply_listen(&mut self) {
+        match config::parse_listen(&self.listen_edit) {
+            Some(addr) => {
+                let restart = self.running && addr != self.cfg.listen;
+                self.cfg.listen = addr.clone();
+                self.listen_edit = addr.clone();
+                config::save(&self.cfg);
+                if restart {
+                    log(&self.logs, format!("moving the listener to {}", addr));
+                    self.stop_listener();
+                    self.start_listener();
+                }
+                self.status = format!("listening on {}", addr);
+            }
+            None => self.status = "invalid listen address, expected host:port or a port number".into(),
+        }
+    }
+
+    fn stop(&mut self) {
+        self.stop_listener();
         for (id, child) in self.children.iter_mut() {
             let _ = child.kill();
             let _ = child.wait();
@@ -370,6 +409,18 @@ impl eframe::App for App {
                     human(self.stats.in_bytes.load(Ordering::Relaxed)),
                     human(self.stats.out_bytes.load(Ordering::Relaxed))
                 ));
+            });
+            ui.horizontal(|ui| {
+                ui.label("listen:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.listen_edit)
+                        .desired_width(160.0)
+                        .hint_text("127.0.0.1:3080"),
+                );
+                if ui.button("Apply").clicked() {
+                    self.apply_listen();
+                }
+                ui.label(egui::RichText::new("host:port, or just a port number").weak().small());
             });
             if !self.status.is_empty() {
                 ui.label(egui::RichText::new(&self.status).weak().italics());
