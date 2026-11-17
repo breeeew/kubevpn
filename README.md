@@ -120,6 +120,13 @@ Environment variables, useful for scripted setup:
 The window can be closed to the tray; the tunnels keep running. The tray menu has *Show window*,
 *Start tunnels*, *Stop tunnels* and *Quit*. A double click on the icon shows the window.
 
+On Windows the window is minimized and its taskbar button is removed (`WS_EX_TOOLWINDOW`) rather than
+hidden with `ShowWindow(SW_HIDE)`. A truly hidden window stops receiving redraws, the egui update loop
+stops, and the tray menu would never be processed again. Minimizing keeps the loop alive.
+
+A diagnostic switch `KUBEVPN_TEST_TRAY=1` hides the window after 6 seconds and shows it again after
+12, which is handy when checking this behaviour without clicking the tray.
+
 ## Configuration
 
 `config.json` is written by the app. Copy `config.example.json` and fill in your own values.

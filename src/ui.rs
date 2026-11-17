@@ -26,6 +26,8 @@ pub struct App {
     tasks: Tasks,
     tray: Option<Tray>,
     last_health_check: Instant,
+    hidden: bool,
+    test_did_hide: bool,
     autostart_login: bool,
     quitting: bool,
     routes: Arc<RwLock<Routes>>,
@@ -64,11 +66,13 @@ impl App {
             restart_at: HashMap::new(),
             tasks: Tasks::new(),
             tray: {
-                let t = Tray::new();
+                let t = Tray::new(cc.egui_ctx.clone());
                 app_log(if t.is_ok() { "tray: created" } else { "tray: unavailable" });
                 t.ok()
             },
             last_health_check: Instant::now(),
+            hidden: false,
+            test_did_hide: false,
             autostart_login: autostart_state(),
             quitting: false,
             routes: Arc::new(RwLock::new(Routes::default())),
@@ -81,6 +85,15 @@ impl App {
             new_rule_profile: String::new(),
             status: String::new(),
         };
+        {
+            // A hidden window stops receiving redraws, so keep the UI loop alive:
+            // without this the tray menu and "show" requests would never be processed.
+            let ctx = cc.egui_ctx.clone();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(Duration::from_millis(500));
+                ctx.request_repaint();
+            });
+        }
         if let Ok(v) = std::env::var("KUBEVPN_AUTOSTART") {
             let enable = matches!(v.trim(), "1" | "true" | "on");
             if set_autostart(enable).is_ok() {
@@ -450,6 +463,61 @@ impl App {
     }
 }
 
+/// Hide/show the window through the platform API.
+///
+/// egui's ViewportCommand::Visible(false) stops the redraw loop on Windows, so the app would never
+/// process the tray menu again. Win32 ShowWindow keeps the loop running while the window is hidden.
+#[cfg(windows)]
+mod window_ctl {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, GetWindowLongPtrW, SetForegroundWindow, SetWindowLongPtrW, ShowWindow, GWL_EXSTYLE,
+        SW_MINIMIZE, SW_RESTORE, SW_SHOW,
+    };
+
+    const WS_EX_TOOLWINDOW: isize = 0x0000_0080;
+    const WS_EX_APPWINDOW: isize = 0x0004_0000;
+
+    fn find(title: &str) -> Option<*mut std::ffi::c_void> {
+        let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+        let handle = unsafe { FindWindowW(std::ptr::null(), wide.as_ptr()) };
+        if handle.is_null() {
+            None
+        } else {
+            Some(handle)
+        }
+    }
+
+    /// Minimize and drop the taskbar button. The window keeps its event loop, so the tray stays
+    /// responsive; hiding it outright would stop redraws and freeze the UI.
+    pub fn hide(title: &str) {
+        if let Some(h) = find(title) {
+            unsafe {
+                let ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+                SetWindowLongPtrW(h, GWL_EXSTYLE, (ex | WS_EX_TOOLWINDOW) & !WS_EX_APPWINDOW);
+                ShowWindow(h, SW_MINIMIZE);
+            }
+        }
+    }
+
+    pub fn show(title: &str) {
+        if let Some(h) = find(title) {
+            unsafe {
+                let ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+                SetWindowLongPtrW(h, GWL_EXSTYLE, ex & !WS_EX_TOOLWINDOW);
+                ShowWindow(h, SW_SHOW);
+                ShowWindow(h, SW_RESTORE);
+                SetForegroundWindow(h);
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod window_ctl {
+    pub fn hide(_title: &str) {}
+    pub fn show(_title: &str) {}
+}
+
 fn autostart_builder() -> Option<auto_launch::AutoLaunch> {
     let exe = std::env::current_exe().ok()?.to_string_lossy().to_string();
     auto_launch::AutoLaunchBuilder::new()
@@ -517,6 +585,9 @@ impl eframe::App for App {
         for action in actions {
             match action {
                 TrayAction::Show => {
+                    app_log("tray: show window");
+                    self.hidden = false;
+                    window_ctl::show("kubevpn");
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
@@ -534,9 +605,32 @@ impl eframe::App for App {
             }
         }
 
-        if self.cfg.minimize_to_tray && !self.quitting && ctx.input(|i| i.viewport().close_requested()) {
+        if self.cfg.minimize_to_tray
+            && !self.quitting
+            && !self.hidden
+            && ctx.input(|i| i.viewport().close_requested())
+        {
+            self.hidden = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            window_ctl::hide("kubevpn");
+            app_log("window hidden to tray");
+            ctx.request_repaint();
+        }
+
+        // Diagnostic switch: hide the window at 6s and show it again at 12s,
+        // so the hide/show path can be verified without clicking the tray.
+        if std::env::var("KUBEVPN_TEST_TRAY").is_ok() {
+            let elapsed = self.started_at.map(|t| t.elapsed()).unwrap_or_default();
+            if !self.test_did_hide && elapsed > Duration::from_secs(6) {
+                self.test_did_hide = true;
+                self.hidden = true;
+                window_ctl::hide("kubevpn");
+                app_log("selftest: window hidden");
+            } else if self.test_did_hide && self.hidden && elapsed > Duration::from_secs(12) {
+                self.hidden = false;
+                window_ctl::show("kubevpn");
+                app_log("selftest: window shown");
+            }
         }
 
         if self.last_health_check.elapsed() > Duration::from_secs(2) {

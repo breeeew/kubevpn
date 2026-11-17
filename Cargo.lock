@@ -1491,6 +1491,7 @@ dependencies = [
  "tokio",
  "tray-icon",
  "ureq",
+ "windows-sys 0.59.0",
  "zip",
 ]
 

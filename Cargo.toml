@@ -24,6 +24,9 @@ flate2 = "1"
 tray-icon = "0.19"
 auto-launch = "0.5"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+
 [profile.release]
 opt-level = "s"
 lto = true

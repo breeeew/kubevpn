@@ -1,5 +1,7 @@
+use std::sync::mpsc::{channel, Receiver, Sender};
+
 use anyhow::Result;
-use tray_icon::menu::{Menu, MenuId, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 pub enum TrayAction {
@@ -11,10 +13,7 @@ pub enum TrayAction {
 
 pub struct Tray {
     _icon: TrayIcon,
-    show: MenuId,
-    start: MenuId,
-    stop: MenuId,
-    quit: MenuId,
+    rx: Receiver<TrayAction>,
 }
 
 fn make_icon() -> Icon {
@@ -26,9 +25,8 @@ fn make_icon() -> Icon {
         for x in 0..size {
             let dx = x as f32 - cx;
             let dy = y as f32 - cx;
-            let inside = (dx * dx + dy * dy).sqrt() < 15.0;
-            let i = ((y * size + x) * 4) as usize;
-            if inside {
+            if (dx * dx + dy * dy).sqrt() < 15.0 {
+                let i = ((y * size + x) * 4) as usize;
                 rgba[i] = 70;
                 rgba[i + 1] = 180;
                 rgba[i + 2] = 120;
@@ -40,7 +38,9 @@ fn make_icon() -> Icon {
 }
 
 impl Tray {
-    pub fn new() -> Result<Self> {
+    /// Menu and icon events are forwarded through a channel; every event also wakes the UI,
+    /// because a window hidden to the tray stops receiving redraws on its own.
+    pub fn new(ctx: egui::Context) -> Result<Self> {
         let menu = Menu::new();
         let show = MenuItem::new("Show window", true, None);
         let start = MenuItem::new("Start tunnels", true, None);
@@ -58,33 +58,61 @@ impl Tray {
             .with_icon(make_icon())
             .build()?;
 
-        Ok(Self {
-            _icon: icon,
-            show: show.id().clone(),
-            start: start.id().clone(),
-            stop: stop.id().clone(),
-            quit: quit.id().clone(),
-        })
+        let (tx, rx) = channel::<TrayAction>();
+
+        let show_id = show.id().clone();
+        let start_id = start.id().clone();
+        let stop_id = stop.id().clone();
+        let quit_id = quit.id().clone();
+        {
+            let tx: Sender<TrayAction> = tx.clone();
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let events = tray_icon::menu::MenuEvent::receiver();
+                while let Ok(event) = events.recv() {
+                    let action = if event.id == show_id {
+                        Some(TrayAction::Show)
+                    } else if event.id == start_id {
+                        Some(TrayAction::Start)
+                    } else if event.id == stop_id {
+                        Some(TrayAction::Stop)
+                    } else if event.id == quit_id {
+                        Some(TrayAction::Quit)
+                    } else {
+                        None
+                    };
+                    if let Some(action) = action {
+                        let _ = tx.send(action);
+                        ctx.request_repaint();
+                    }
+                }
+            });
+        }
+        {
+            let tx: Sender<TrayAction> = tx.clone();
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let events = tray_icon::TrayIconEvent::receiver();
+                while let Ok(event) = events.recv() {
+                    match event {
+                        tray_icon::TrayIconEvent::DoubleClick { .. }
+                        | tray_icon::TrayIconEvent::Click { .. } => {
+                            let _ = tx.send(TrayAction::Show);
+                            ctx.request_repaint();
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        }
+
+        Ok(Self { _icon: icon, rx })
     }
 
-    /// Drain pending tray events.
     pub fn poll(&self) -> Vec<TrayAction> {
         let mut actions = Vec::new();
-        while let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
-            if event.id == self.show {
-                actions.push(TrayAction::Show);
-            } else if event.id == self.start {
-                actions.push(TrayAction::Start);
-            } else if event.id == self.stop {
-                actions.push(TrayAction::Stop);
-            } else if event.id == self.quit {
-                actions.push(TrayAction::Quit);
-            }
-        }
-        if let Ok(event) = tray_icon::TrayIconEvent::receiver().try_recv() {
-            if matches!(event, tray_icon::TrayIconEvent::DoubleClick { .. }) {
-                actions.push(TrayAction::Show);
-            }
+        while let Ok(action) = self.rx.try_recv() {
+            actions.push(action);
         }
         actions
     }
