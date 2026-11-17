@@ -1,0 +1,15 @@
+/target
+**/*.rs.bk
+
+# local settings contain tunnel credentials - never commit them
+config.json
+config.before-sub.json
+*.local.json
+
+# local toolchain configuration (machine specific)
+.cargo/
+
+# screenshots and logs
+*.png
+*.jpg
+*.log

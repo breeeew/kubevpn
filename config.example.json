@@ -1,0 +1,26 @@
+{
+  "listen": "127.0.0.1:3080",
+  "autostart": false,
+  "binaries": {
+    "awg": "C:/tools/awg-wireproxy/wireproxy.exe",
+    "xray": "C:/tools/xray/xray.exe",
+    "singbox": ""
+  },
+  "profiles": [
+    {
+      "id": "p1",
+      "name": "example-awg",
+      "kind": "awg",
+      "text": "[Interface]\nAddress = 10.0.0.2/32\nPrivateKey = REPLACE_WITH_CLIENT_PRIVATE_KEY\nJc = 5\nJmin = 10\nJmax = 50\nS1 = 12\nS2 = 12\nH1 = 1\nH2 = 2\nH3 = 3\nH4 = 4\n\n[Peer]\nPublicKey = REPLACE_WITH_SERVER_PUBLIC_KEY\nEndpoint = 203.0.113.10:51820\nAllowedIPs = 0.0.0.0/0\nPersistentKeepalive = 25\n",
+      "port": 15001,
+      "enabled": true
+    }
+  ],
+  "rules": [
+    {
+      "suffix": "internal.example.com",
+      "profile": "p1"
+    }
+  ],
+  "default_profile": null
+}
