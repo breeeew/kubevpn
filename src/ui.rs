@@ -172,8 +172,17 @@ impl App {
             log_view_at: Instant::now(),
             status: String::new(),
         };
-        // No periodic repaint thread: background tasks and tray events wake the loop
-        // via request_repaint(), and update() schedules a slow 1s tick for timers.
+        // LOAD-BEARING on Windows: a minimized window stops honoring egui's internal
+        // repaint timers, so the update loop falls asleep and tray events, health checks
+        // and probes are never processed (a single request_repaint() from the tray thread
+        // does not wake it either). An external periodic repaint keeps the loop alive.
+        {
+            let ctx = cc.egui_ctx.clone();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(Duration::from_millis(500));
+                ctx.request_repaint();
+            });
+        }
         if let Ok(v) = std::env::var("KUBEVPN_AUTOSTART") {
             let enable = matches!(v.trim(), "1" | "true" | "on");
             if set_autostart(enable).is_ok() {
