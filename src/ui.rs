@@ -1243,13 +1243,20 @@ fn engine_row(
 /// process the tray menu again. Win32 ShowWindow keeps the loop running while the window is hidden.
 #[cfg(windows)]
 mod window_ctl {
+    use std::sync::Mutex;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        FindWindowW, GetWindowLongPtrW, SetForegroundWindow, SetWindowLongPtrW, ShowWindow,
-        GWL_EXSTYLE, SW_MINIMIZE, SW_RESTORE, SW_SHOW,
+        FindWindowW, GetWindowLongPtrW, GetWindowPlacement, SetForegroundWindow, SetWindowLongPtrW,
+        SetWindowPlacement, ShowWindow, GWL_EXSTYLE, SW_MINIMIZE, SW_RESTORE, WINDOWPLACEMENT,
     };
 
     const WS_EX_TOOLWINDOW: isize = 0x0000_0080;
     const WS_EX_APPWINDOW: isize = 0x0004_0000;
+
+    /// Normal geometry captured before hiding. While the window is minimized, WM_SIZE
+    /// reports the tiny minimized strip and winit forwards that to egui, which can
+    /// clobber the size the window is restored with (it comes back as a thin bar).
+    /// Restoring the saved WINDOWPLACEMENT explicitly pins the original geometry.
+    static SAVED_PLACEMENT: Mutex<Option<WINDOWPLACEMENT>> = Mutex::new(None);
 
     fn find(title: &str) -> Option<*mut std::ffi::c_void> {
         let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
@@ -1266,6 +1273,11 @@ mod window_ctl {
     pub fn hide(title: &str) {
         if let Some(h) = find(title) {
             unsafe {
+                let mut wp: WINDOWPLACEMENT = std::mem::zeroed();
+                wp.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+                if GetWindowPlacement(h, &mut wp) != 0 {
+                    *SAVED_PLACEMENT.lock().unwrap() = Some(wp);
+                }
                 let ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
                 SetWindowLongPtrW(h, GWL_EXSTYLE, (ex | WS_EX_TOOLWINDOW) & !WS_EX_APPWINDOW);
                 ShowWindow(h, SW_MINIMIZE);
@@ -1278,8 +1290,16 @@ mod window_ctl {
             unsafe {
                 let ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
                 SetWindowLongPtrW(h, GWL_EXSTYLE, ex & !WS_EX_TOOLWINDOW);
-                ShowWindow(h, SW_SHOW);
-                ShowWindow(h, SW_RESTORE);
+                let saved = SAVED_PLACEMENT.lock().unwrap().take();
+                if let Some(mut wp) = saved {
+                    wp.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+                    if wp.showCmd == SW_MINIMIZE as u32 {
+                        wp.showCmd = SW_RESTORE as u32;
+                    }
+                    SetWindowPlacement(h, &wp);
+                } else {
+                    ShowWindow(h, SW_RESTORE);
+                }
                 SetForegroundWindow(h);
             }
         }
@@ -1433,7 +1453,8 @@ impl eframe::App for App {
                     app_log("tray: show window");
                     self.hidden = false;
                     window_ctl::show("kubevpn");
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    // No ViewportCommand::Visible here: winit's visibility flag machinery
+                    // can re-show the window with a stale size; Win32 above owns the show.
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
                 TrayAction::Start => {
