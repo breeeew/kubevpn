@@ -110,6 +110,7 @@ pub struct App {
     log_view: Option<String>,
     log_view_text: String,
     log_view_at: Instant,
+    repin_at: Option<Instant>,
     status: String,
 }
 
@@ -170,6 +171,7 @@ impl App {
             log_view: None,
             log_view_text: String::new(),
             log_view_at: Instant::now(),
+            repin_at: None,
             status: String::new(),
         };
         // LOAD-BEARING on Windows: a minimized window stops honoring egui's internal
@@ -1245,9 +1247,12 @@ fn engine_row(
 mod window_ctl {
     use std::sync::Mutex;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        FindWindowW, GetWindowLongPtrW, GetWindowPlacement, SetForegroundWindow, SetWindowLongPtrW,
-        SetWindowPlacement, ShowWindow, GWL_EXSTYLE, SW_MINIMIZE, SW_RESTORE, WINDOWPLACEMENT,
+        FindWindowW, GetWindowLongPtrW, GetWindowPlacement, IsIconic, SetForegroundWindow,
+        SetWindowLongPtrW, SetWindowPlacement, SetWindowPos, ShowWindow, GWL_EXSTYLE,
+        SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER, SW_MINIMIZE, SW_RESTORE, WINDOWPLACEMENT,
     };
+
+    use crate::util::app_log;
 
     const WS_EX_TOOLWINDOW: isize = 0x0000_0080;
     const WS_EX_APPWINDOW: isize = 0x0004_0000;
@@ -1268,19 +1273,76 @@ mod window_ctl {
         }
     }
 
+    fn placement(h: *mut std::ffi::c_void) -> Option<WINDOWPLACEMENT> {
+        unsafe {
+            let mut wp: WINDOWPLACEMENT = std::mem::zeroed();
+            wp.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+            if GetWindowPlacement(h, &mut wp) != 0 {
+                Some(wp)
+            } else {
+                None
+            }
+        }
+    }
+
+    fn log_placement(tag: &str, h: *mut std::ffi::c_void, wp: &WINDOWPLACEMENT) {
+        let r = wp.rcNormalPosition;
+        app_log(&format!(
+            "window_ctl {}: hwnd={:?} cmd={} rect=({},{},{},{}) iconic={}",
+            tag,
+            h,
+            wp.showCmd,
+            r.left,
+            r.top,
+            r.right,
+            r.bottom,
+            unsafe { IsIconic(h) }
+        ));
+    }
+
     /// Minimize and drop the taskbar button. The window keeps its event loop, so the tray stays
     /// responsive; hiding it outright would stop redraws and freeze the UI.
     pub fn hide(title: &str) {
         if let Some(h) = find(title) {
             unsafe {
-                let mut wp: WINDOWPLACEMENT = std::mem::zeroed();
-                wp.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
-                if GetWindowPlacement(h, &mut wp) != 0 {
+                if let Some(wp) = placement(h) {
+                    log_placement("hide captured", h, &wp);
                     *SAVED_PLACEMENT.lock().unwrap() = Some(wp);
                 }
                 let ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
                 SetWindowLongPtrW(h, GWL_EXSTYLE, (ex | WS_EX_TOOLWINDOW) & !WS_EX_APPWINDOW);
                 ShowWindow(h, SW_MINIMIZE);
+            }
+        } else {
+            app_log("window_ctl hide: window not found");
+        }
+    }
+
+    /// Restore the saved outer rect with SetWindowPos; used right after show and
+    /// again a moment later in case something re-shows the minimized strip.
+    pub fn repin(title: &str) {
+        let saved = *SAVED_PLACEMENT.lock().unwrap();
+        let Some(wp) = saved else {
+            return;
+        };
+        if let Some(h) = find(title) {
+            unsafe {
+                if IsIconic(h) != 0 {
+                    ShowWindow(h, SW_RESTORE);
+                }
+                let r = wp.rcNormalPosition;
+                SetWindowPos(
+                    h,
+                    std::ptr::null_mut(),
+                    r.left,
+                    r.top,
+                    r.right - r.left,
+                    r.bottom - r.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                );
+                if let Some(after) = placement(h) {
+                    log_placement("repin", h, &after);
+                }
             }
         }
     }
@@ -1296,12 +1358,34 @@ mod window_ctl {
                     if wp.showCmd == SW_MINIMIZE as u32 {
                         wp.showCmd = SW_RESTORE as u32;
                     }
-                    SetWindowPlacement(h, &wp);
+                    let sp = SetWindowPlacement(h, &wp);
+                    let r = wp.rcNormalPosition;
+                    let swp = SetWindowPos(
+                        h,
+                        std::ptr::null_mut(),
+                        r.left,
+                        r.top,
+                        r.right - r.left,
+                        r.bottom - r.top,
+                        SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                    );
+                    app_log(&format!(
+                        "window_ctl show: SetWindowPlacement={} SetWindowPos={}",
+                        sp, swp
+                    ));
+                    if let Some(after) = placement(h) {
+                        log_placement("show after", h, &after);
+                    }
+                    // keep the rect for the delayed re-pin
+                    *SAVED_PLACEMENT.lock().unwrap() = Some(wp);
                 } else {
                     ShowWindow(h, SW_RESTORE);
+                    app_log("window_ctl show: no saved placement, SW_RESTORE");
                 }
                 SetForegroundWindow(h);
             }
+        } else {
+            app_log("window_ctl show: window not found");
         }
     }
 }
@@ -1310,6 +1394,7 @@ mod window_ctl {
 mod window_ctl {
     pub fn hide(_title: &str) {}
     pub fn show(_title: &str) {}
+    pub fn repin(_title: &str) {}
 }
 
 fn autostart_builder() -> Option<auto_launch::AutoLaunch> {
@@ -1456,6 +1541,9 @@ impl eframe::App for App {
                     // No ViewportCommand::Visible here: winit's visibility flag machinery
                     // can re-show the window with a stale size; Win32 above owns the show.
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    // Re-pin the geometry shortly after: some winit/egui event processed
+                    // after this frame can still re-show the minimized strip.
+                    self.repin_at = Some(Instant::now() + Duration::from_millis(600));
                 }
                 TrayAction::Start => {
                     if !self.running {
@@ -1496,6 +1584,13 @@ impl eframe::App for App {
                 self.hidden = false;
                 window_ctl::show("kubevpn");
                 app_log("selftest: window shown");
+            }
+        }
+
+        if let Some(t) = self.repin_at {
+            if Instant::now() >= t {
+                self.repin_at = None;
+                window_ctl::repin("kubevpn");
             }
         }
 
