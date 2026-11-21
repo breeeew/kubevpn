@@ -12,12 +12,12 @@ pub enum TrayAction {
 }
 
 pub struct Tray {
-    _icon: TrayIcon,
+    icon: TrayIcon,
     rx: Receiver<TrayAction>,
 }
 
-fn make_icon() -> Icon {
-    // Simple 32x32 rounded square, drawn in code so the repo carries no binary assets.
+fn make_icon(rgb: [u8; 3]) -> Icon {
+    // Simple 32x32 circle, drawn in code so the repo carries no binary assets.
     let size = 32u32;
     let mut rgba = vec![0u8; (size * size * 4) as usize];
     let cx = (size as f32 - 1.0) / 2.0;
@@ -27,9 +27,9 @@ fn make_icon() -> Icon {
             let dy = y as f32 - cx;
             if (dx * dx + dy * dy).sqrt() < 15.0 {
                 let i = ((y * size + x) * 4) as usize;
-                rgba[i] = 70;
-                rgba[i + 1] = 180;
-                rgba[i + 2] = 120;
+                rgba[i] = rgb[0];
+                rgba[i + 1] = rgb[1];
+                rgba[i + 2] = rgb[2];
                 rgba[i + 3] = 255;
             }
         }
@@ -55,7 +55,7 @@ impl Tray {
         let icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_tooltip("kubevpn")
-            .with_icon(make_icon())
+            .with_icon(make_icon([120, 120, 120]))
             .build()?;
 
         let (tx, rx) = channel::<TrayAction>();
@@ -106,7 +106,14 @@ impl Tray {
             });
         }
 
-        Ok(Self { _icon: icon, rx })
+        Ok(Self { icon, rx })
+    }
+
+    /// Reflect the app state in the tray: color (gray stopped / green running /
+    /// red degraded) and a tooltip with live counters.
+    pub fn set_state(&self, rgb: [u8; 3], tooltip: &str) {
+        let _ = self.icon.set_icon(Some(make_icon(rgb)));
+        let _ = self.icon.set_tooltip(Some(tooltip));
     }
 
     pub fn poll(&self) -> Vec<TrayAction> {

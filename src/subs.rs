@@ -68,7 +68,8 @@ pub fn parse(body: &str) -> Result<Vec<Item>> {
             text: item.to_string(),
         }]);
     }
-    bail!("unrecognised subscription format (expected JSON)")
+    // Not JSON: try a share-URI list (plain or base64-encoded).
+    crate::uris::parse_uri_list(t)
 }
 #[cfg(test)]
 mod tests {

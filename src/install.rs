@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::util::{app_log, log, proxy_from_env, Logs};
 
@@ -54,7 +55,7 @@ pub fn engine_dir() -> PathBuf {
 fn agent() -> ureq::Agent {
     let mut builder = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(120))
-        .user_agent("kubevpn/0.1");
+        .user_agent("kubevpn/0.2");
     if let Some(p) = proxy_from_env() {
         if let Ok(proxy) = ureq::Proxy::new(&p) {
             builder = builder.proxy(proxy);
@@ -144,7 +145,7 @@ fn sha256_of(path: &Path) -> Result<String> {
     use std::io::Read;
     let mut f = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
-    let mut buf = [0u8; 8192];
+    let mut buf = [0u8; 65536];
     loop {
         let n = f.read(&mut buf)?;
         if n == 0 {
@@ -152,118 +153,73 @@ fn sha256_of(path: &Path) -> Result<String> {
         }
         hasher.update(&buf[..n]);
     }
-    Ok(hasher.finish_hex())
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// Minimal SHA-256, so the installer does not need an extra dependency.
-struct Sha256 {
-    state: [u32; 8],
-    buf: Vec<u8>,
-    len: u64,
+/// Find the expected SHA-256 for an asset in a "sums" style file
+/// (checksums.txt / sha256sum.txt: "<hex>  <name>" per line).
+fn sum_for_asset(text: &str, asset_name: &str) -> Option<String> {
+    text.lines()
+        .find(|l| l.trim_end().ends_with(asset_name))
+        .and_then(|l| l.split_whitespace().next())
+        .map(|s| s.to_string())
 }
 
-impl Sha256 {
-    fn new() -> Self {
-        Self {
-            state: [
-                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-                0x5be0cd19,
-            ],
-            buf: Vec::new(),
-            len: 0,
+/// Verify the downloaded archive against whatever the release publishes:
+/// checksums.txt (awg-wireproxy), sha256sum.txt (sing-box) or a per-asset
+/// .dgst file with "SHA256= ..." lines (Xray-core). Returns whether a checksum
+/// was actually verified; a missing checksum is a visible warning, not silence.
+fn verify_checksum(
+    repo: &str,
+    tag: &str,
+    asset_name: &str,
+    archive: &Path,
+    logs: &Logs,
+) -> Result<bool> {
+    let base = format!("https://github.com/{}/releases/download/{}", repo, tag);
+    let mut expected: Option<String> = None;
+    for sums in ["checksums.txt", "sha256sum.txt"] {
+        if let Ok(text) = get_text(&format!("{}/{}", base, sums)) {
+            if let Some(sum) = sum_for_asset(&text, asset_name) {
+                expected = Some(sum);
+                break;
+            }
         }
     }
-
-    fn update(&mut self, data: &[u8]) {
-        self.len = self.len.wrapping_add(data.len() as u64);
-        self.buf.extend_from_slice(data);
-        while self.buf.len() >= 64 {
-            let block: Vec<u8> = self.buf.drain(..64).collect();
-            self.compress(&block);
+    if expected.is_none() {
+        if let Ok(text) = get_text(&format!("{}/{}.dgst", base, asset_name)) {
+            for line in text.lines() {
+                let kv = line.split_once('=').or_else(|| line.split_once(':'));
+                if let Some((k, v)) = kv {
+                    if k.trim().eq_ignore_ascii_case("SHA256") {
+                        expected = Some(v.trim().to_string());
+                        break;
+                    }
+                }
+            }
         }
     }
-
-    fn compress(&mut self, block: &[u8]) {
-        const K: [u32; 64] = [
-            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
-            0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
-            0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
-            0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-            0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
-            0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-            0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
-            0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-            0xc67178f2,
-        ];
-        let mut w = [0u32; 64];
-        for i in 0..16 {
-            w[i] = u32::from_be_bytes([
-                block[i * 4],
-                block[i * 4 + 1],
-                block[i * 4 + 2],
-                block[i * 4 + 3],
-            ]);
+    match expected {
+        Some(expected) => {
+            let actual = sha256_of(archive)?;
+            if expected.eq_ignore_ascii_case(&actual) {
+                app_log(&format!("{}: checksum ok", asset_name));
+                log(logs, "checksum ok");
+                Ok(true)
+            } else {
+                app_log(&format!("{}: checksum mismatch", asset_name));
+                bail!("checksum mismatch: expected {}, got {}", expected, actual)
+            }
         }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16]
-                .wrapping_add(s0)
-                .wrapping_add(w[i - 7])
-                .wrapping_add(s1);
+        None => {
+            let msg = format!(
+                "{}: no checksum published by the release, verified by HTTPS only",
+                asset_name
+            );
+            app_log(&msg);
+            log(logs, msg);
+            Ok(false)
         }
-        let mut a = self.state[0];
-        let mut b = self.state[1];
-        let mut c = self.state[2];
-        let mut d = self.state[3];
-        let mut e = self.state[4];
-        let mut f = self.state[5];
-        let mut g = self.state[6];
-        let mut h = self.state[7];
-        for i in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ ((!e) & g);
-            let t1 = h
-                .wrapping_add(s1)
-                .wrapping_add(ch)
-                .wrapping_add(K[i])
-                .wrapping_add(w[i]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let t2 = s0.wrapping_add(maj);
-            h = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(t1);
-            d = c;
-            c = b;
-            b = a;
-            a = t1.wrapping_add(t2);
-        }
-        self.state[0] = self.state[0].wrapping_add(a);
-        self.state[1] = self.state[1].wrapping_add(b);
-        self.state[2] = self.state[2].wrapping_add(c);
-        self.state[3] = self.state[3].wrapping_add(d);
-        self.state[4] = self.state[4].wrapping_add(e);
-        self.state[5] = self.state[5].wrapping_add(f);
-        self.state[6] = self.state[6].wrapping_add(g);
-        self.state[7] = self.state[7].wrapping_add(h);
-    }
-
-    fn finish_hex(mut self) -> String {
-        let bit_len = self.len.wrapping_mul(8);
-        self.buf.push(0x80);
-        while self.buf.len() % 64 != 56 {
-            self.buf.push(0);
-        }
-        self.buf.extend_from_slice(&bit_len.to_be_bytes());
-        let blocks: Vec<u8> = self.buf.clone();
-        for chunk in blocks.chunks(64) {
-            let block: Vec<u8> = chunk.to_vec();
-            self.compress(&block);
-        }
-        self.state.iter().map(|v| format!("{:08x}", v)).collect()
     }
 }
 
@@ -333,7 +289,9 @@ fn find_binary(dir: &Path, key: &str) -> Option<PathBuf> {
     None
 }
 
-/// Download and unpack the latest release of an engine. Returns the path to the executable.
+/// Download and unpack the latest release of an engine into a per-version directory
+/// (engines/<key>/<tag>/), so a running binary is never overwritten and previous
+/// versions stay available for rollback. Returns the path to the executable.
 pub fn install(key: &str, logs: &Logs) -> Result<PathBuf> {
     let engine = ENGINES
         .iter()
@@ -360,32 +318,23 @@ pub fn install(key: &str, logs: &Logs) -> Result<PathBuf> {
         format!("{} {} -> {}", engine.repo, release.tag_name, asset.name),
     );
 
-    let dir = engine_dir().join(key);
+    let tag: String = release
+        .tag_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let dir = engine_dir().join(key).join(&tag);
     std::fs::create_dir_all(&dir)?;
     let archive = dir.join(&asset.name);
     download(&asset.browser_download_url, &archive).context("downloading asset")?;
 
-    // Verify the checksum when the release publishes one.
-    let sums_url = format!(
-        "https://github.com/{}/releases/download/{}/checksums.txt",
-        engine.repo, release.tag_name
-    );
-    if let Ok(text) = get_text(&sums_url) {
-        if let Some(expected) = text
-            .lines()
-            .find(|l| l.trim_end().ends_with(&asset.name))
-            .and_then(|l| l.split_whitespace().next())
-        {
-            let actual = sha256_of(&archive)?;
-            if expected.eq_ignore_ascii_case(&actual) {
-                app_log(&format!("{}: checksum ok", asset.name));
-                log(logs, "checksum ok");
-            } else {
-                app_log(&format!("{}: checksum mismatch", asset.name));
-                bail!("checksum mismatch: expected {}, got {}", expected, actual);
-            }
-        }
-    }
+    verify_checksum(engine.repo, &release.tag_name, &asset.name, &archive, logs)?;
 
     extract(&archive, &dir).context("unpacking archive")?;
     let binary =
@@ -398,7 +347,34 @@ pub fn install(key: &str, logs: &Logs) -> Result<PathBuf> {
     }
 
     let _ = std::fs::remove_file(&archive);
-    app_log(&format!("installed {} at {}", key, binary.display()));
-    log(logs, format!("{} installed: {}", key, binary.display()));
+    app_log(&format!(
+        "installed {} {} at {}",
+        key,
+        release.tag_name,
+        binary.display()
+    ));
+    log(
+        logs,
+        format!(
+            "{} {} installed: {}",
+            key,
+            release.tag_name,
+            binary.display()
+        ),
+    );
     Ok(binary)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sums_file_matching() {
+        let text = "abc123  other.zip\ndef456  Xray-windows-64.zip\n";
+        assert_eq!(
+            sum_for_asset(text, "Xray-windows-64.zip").as_deref(),
+            Some("def456")
+        );
+        assert_eq!(sum_for_asset(text, "missing.zip"), None);
+    }
 }

@@ -14,18 +14,26 @@
       "text": "[Interface]\nAddress = 10.0.0.2/32\nPrivateKey = REPLACE_WITH_CLIENT_PRIVATE_KEY\nJc = 5\nJmin = 10\nJmax = 50\nS1 = 12\nS2 = 12\nH1 = 1\nH2 = 2\nH3 = 3\nH4 = 4\n\n[Peer]\nPublicKey = REPLACE_WITH_SERVER_PUBLIC_KEY\nEndpoint = 203.0.113.10:51820\nAllowedIPs = 0.0.0.0/0\nPersistentKeepalive = 25\n",
       "port": 15001,
       "enabled": true,
-      "subscription": null
+      "subscription": null,
+      "probe": null
     }
   ],
   "rules": [
     {
       "suffix": "internal.example.com",
       "profile": "p1"
+    },
+    {
+      "suffix": "10.0.0.0/8",
+      "profile": "p1"
     }
   ],
   "default_profile": null,
   "minimize_to_tray": true,
   "fail_closed": false,
+  "auth": null,
+  "log_requests": true,
+  "subscription_refresh_hours": 24,
   "subscriptions": [
     {
       "id": "s1",

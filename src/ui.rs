@@ -7,13 +7,73 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
-use crate::config::{self, AppConfig, Profile, Rule};
+use crate::config::{self, AppConfig, Auth, Profile, Rule};
 use crate::engines;
 use crate::proxy::{self, Routes, Stats};
 use crate::subs;
 use crate::tasks::{TaskResult, Tasks};
 use crate::tray::{Tray, TrayAction};
-use crate::util::{app_log, human, log, new_logs, Logs};
+use crate::util::{app_log, human, log, new_logs, now_secs, Logs};
+
+/// Result of the periodic end-to-end health probe of a running profile.
+struct Health {
+    ok: bool,
+    latency_ms: u64,
+    fails: u32,
+}
+
+/// Probe target for a profile: explicit config wins; by default xray/sing-box are
+/// probed end-to-end against a public host, awg only handshakes with its local SOCKS
+/// server (a cluster tunnel may not carry arbitrary internet traffic).
+fn probe_target(p: &Profile) -> Option<String> {
+    match &p.probe {
+        Some(s) if s.trim().is_empty() => None,
+        Some(s) => Some(s.clone()),
+        None => {
+            if p.kind == "awg" {
+                None
+            } else {
+                Some("www.gstatic.com:443".to_string())
+            }
+        }
+    }
+}
+
+/// Tail of a sidecar log file (both naming schemes are checked), for the in-app viewer.
+fn read_sidecar_log(id: &str, kind: &str) -> String {
+    let dir = engines::profile_dir();
+    let mut out = String::new();
+    for name in [format!("{}.log", id), format!("{}.{}.log", id, kind)] {
+        let p = dir.join(&name);
+        let Ok(meta) = std::fs::metadata(&p) else {
+            continue;
+        };
+        if meta.len() == 0 {
+            continue;
+        }
+        if let Ok(text) = std::fs::read_to_string(&p) {
+            let tail = if text.len() > 65536 {
+                let mut cut = text.len() - 65536;
+                while !text.is_char_boundary(cut) {
+                    cut += 1;
+                }
+                &text[cut..]
+            } else {
+                text.as_str()
+            };
+            let lines: Vec<&str> = tail.lines().collect();
+            let start = lines.len().saturating_sub(200);
+            out.push_str(&format!("--- {} ---\n", name));
+            out.push_str(&lines[start..].join("\n"));
+            out.push('\n');
+        }
+    }
+    if out.is_empty() {
+        "(no sidecar log yet)".to_string()
+    } else {
+        out
+    }
+}
 
 pub struct App {
     cfg: AppConfig,
@@ -25,8 +85,14 @@ pub struct App {
     profile_status: HashMap<String, String>,
     refresh_pending: HashSet<String>,
     restart_at: HashMap<String, Instant>,
+    restart_attempts: HashMap<String, u32>,
+    health: HashMap<String, Health>,
+    probe_pending: HashSet<String>,
+    last_probe: Instant,
+    last_sub_check: Instant,
     tasks: Tasks,
     tray: Option<Tray>,
+    tray_state: Option<(bool, bool)>,
     last_health_check: Instant,
     hidden: bool,
     test_did_hide: bool,
@@ -40,6 +106,10 @@ pub struct App {
     import_url: String,
     new_suffix: String,
     new_rule_profile: String,
+    confirm_install: Option<String>,
+    log_view: Option<String>,
+    log_view_text: String,
+    log_view_at: Instant,
     status: String,
 }
 
@@ -67,7 +137,12 @@ impl App {
             profile_status: HashMap::new(),
             refresh_pending: HashSet::new(),
             restart_at: HashMap::new(),
-            tasks: Tasks::new(),
+            restart_attempts: HashMap::new(),
+            health: HashMap::new(),
+            probe_pending: HashSet::new(),
+            last_probe: Instant::now(),
+            last_sub_check: Instant::now(),
+            tasks: Tasks::new(cc.egui_ctx.clone()),
             tray: {
                 let t = Tray::new(cc.egui_ctx.clone());
                 app_log(if t.is_ok() {
@@ -77,6 +152,7 @@ impl App {
                 });
                 t.ok()
             },
+            tray_state: None,
             last_health_check: Instant::now(),
             hidden: false,
             test_did_hide: false,
@@ -90,17 +166,14 @@ impl App {
             import_url: String::new(),
             new_suffix: String::new(),
             new_rule_profile: String::new(),
+            confirm_install: None,
+            log_view: None,
+            log_view_text: String::new(),
+            log_view_at: Instant::now(),
             status: String::new(),
         };
-        {
-            // A hidden window stops receiving redraws, so keep the UI loop alive:
-            // without this the tray menu and "show" requests would never be processed.
-            let ctx = cc.egui_ctx.clone();
-            std::thread::spawn(move || loop {
-                std::thread::sleep(Duration::from_millis(500));
-                ctx.request_repaint();
-            });
-        }
+        // No periodic repaint thread: background tasks and tray events wake the loop
+        // via request_repaint(), and update() schedules a slow 1s tick for timers.
         if let Ok(v) = std::env::var("KUBEVPN_AUTOSTART") {
             let enable = matches!(v.trim(), "1" | "true" | "on");
             if set_autostart(enable).is_ok() {
@@ -120,6 +193,7 @@ impl App {
         if app.cfg.autostart {
             app.start();
         }
+        app.refresh_due_subscriptions();
         app
     }
 
@@ -182,6 +256,7 @@ impl App {
             port,
             enabled: true,
             subscription: None,
+            probe: None,
         });
         self.status = format!("imported {} as {}", origin, id);
         config::save(&self.cfg);
@@ -240,6 +315,29 @@ impl App {
         self.refresh_pending.insert(id.to_string());
         self.status = format!("refreshing {}...", id);
         self.tasks.refresh(id.to_string(), url, self.logs.clone());
+    }
+
+    /// Auto-refresh subscriptions whose last success is older than the configured interval.
+    fn refresh_due_subscriptions(&mut self) {
+        let hours = self.cfg.subscription_refresh_hours;
+        if hours == 0 {
+            return;
+        }
+        let now = now_secs();
+        let due: Vec<String> = self
+            .cfg
+            .subscriptions
+            .iter()
+            .filter(|s| {
+                !self.refresh_pending.contains(&s.id)
+                    && s.last_refresh
+                        .is_none_or(|t| now.saturating_sub(t) >= hours * 3600)
+            })
+            .map(|s| s.id.clone())
+            .collect();
+        for id in due {
+            self.refresh_subscription(&id);
+        }
     }
 
     /// Reconciles a fetched subscription with the stored profiles: new configs are added,
@@ -332,6 +430,7 @@ impl App {
                         port,
                         enabled: true,
                         subscription: Some(id.to_string()),
+                        probe: None,
                     });
                     fresh.push(pid);
                     added += 1;
@@ -466,6 +565,13 @@ impl App {
             .default_open(true)
             .show(ui, |ui| {
                 ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "longest suffix / prefix wins; domain, IP or CIDR (10.0.0.0/8)",
+                    )
+                    .weak()
+                    .small(),
+                );
                 let ids: Vec<(String, String)> = self
                     .cfg
                     .profiles
@@ -473,12 +579,15 @@ impl App {
                     .map(|p| (p.id.clone(), p.name.clone()))
                     .collect();
                 let mut remove_rule: Option<usize> = None;
+                let mut move_rule: Option<(usize, i32)> = None;
                 egui::Grid::new("rules")
-                    .num_columns(3)
+                    .num_columns(5)
                     .spacing([8.0, 6.0])
                     .show(ui, |ui| {
-                        ui.label(egui::RichText::new("domain suffix").strong());
+                        ui.label(egui::RichText::new("domain / IP / CIDR").strong());
                         ui.label(egui::RichText::new("profile").strong());
+                        ui.label("");
+                        ui.label("");
                         ui.label("");
                         ui.end_row();
                         for (i, r) in self.cfg.rules.iter().enumerate() {
@@ -492,6 +601,21 @@ impl App {
                             if ui.small_button("x").clicked() {
                                 remove_rule = Some(i);
                             }
+                            if ui
+                                .add_enabled(i > 0, egui::Button::new("▲").small())
+                                .clicked()
+                            {
+                                move_rule = Some((i, -1));
+                            }
+                            if ui
+                                .add_enabled(
+                                    i + 1 < self.cfg.rules.len(),
+                                    egui::Button::new("▼").small(),
+                                )
+                                .clicked()
+                            {
+                                move_rule = Some((i, 1));
+                            }
                             ui.end_row();
                         }
                     });
@@ -500,12 +624,20 @@ impl App {
                     config::save(&self.cfg);
                     self.refresh_routes();
                 }
+                if let Some((i, dir)) = move_rule {
+                    let j = (i as i32 + dir) as usize;
+                    if j < self.cfg.rules.len() {
+                        self.cfg.rules.swap(i, j);
+                        config::save(&self.cfg);
+                        self.refresh_routes();
+                    }
+                }
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.new_suffix)
                             .desired_width(150.0)
-                            .hint_text("example.com"),
+                            .hint_text("example.com or 10.0.0.0/8"),
                     );
                     if self.new_rule_profile.is_empty() {
                         if let Some((id, _)) = ids.first() {
@@ -586,38 +718,45 @@ impl App {
             .show(ui, |ui| {
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new("Engine binaries").strong());
-                ui.horizontal(|ui| {
-                    ui.label("awg-wireproxy:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.cfg.binaries.awg).desired_width(220.0),
-                    );
-                    if ui.small_button("install").clicked() {
-                        self.install_engine("awg");
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("xray:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.cfg.binaries.xray)
-                            .desired_width(220.0),
-                    );
-                    if ui.small_button("install").clicked() {
-                        self.install_engine("xray");
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("sing-box:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.cfg.binaries.singbox)
-                            .desired_width(220.0),
-                    );
-                    if ui.small_button("install").clicked() {
-                        self.install_engine("singbox");
-                    }
-                });
+                let (inst, cancel) = engine_row(
+                    ui,
+                    "awg-wireproxy:",
+                    &mut self.cfg.binaries.awg,
+                    self.confirm_install.as_deref() == Some("awg"),
+                );
+                if inst {
+                    self.request_install("awg");
+                }
+                if cancel {
+                    self.confirm_install = None;
+                }
+                let (inst, cancel) = engine_row(
+                    ui,
+                    "xray:",
+                    &mut self.cfg.binaries.xray,
+                    self.confirm_install.as_deref() == Some("xray"),
+                );
+                if inst {
+                    self.request_install("xray");
+                }
+                if cancel {
+                    self.confirm_install = None;
+                }
+                let (inst, cancel) = engine_row(
+                    ui,
+                    "sing-box:",
+                    &mut self.cfg.binaries.singbox,
+                    self.confirm_install.as_deref() == Some("singbox"),
+                );
+                if inst {
+                    self.request_install("singbox");
+                }
+                if cancel {
+                    self.confirm_install = None;
+                }
                 ui.label(
                     egui::RichText::new(
-                        "install pulls the latest GitHub release and verifies its checksum",
+                        "install pulls the latest GitHub release into a per-version folder and verifies its checksum",
                     )
                     .weak()
                     .small(),
@@ -663,6 +802,79 @@ impl App {
                         "routes to stopped profiles now fall back to direct".into()
                     };
                 }
+                if ui
+                    .checkbox(&mut self.cfg.log_requests, "log every proxied request")
+                    .changed()
+                {
+                    config::save(&self.cfg);
+                    self.refresh_routes();
+                }
+                ui.horizontal(|ui| {
+                    ui.label("auto-refresh subscriptions every");
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut self.cfg.subscription_refresh_hours)
+                                .range(0..=168)
+                                .suffix(" h"),
+                        )
+                        .changed()
+                    {
+                        config::save(&self.cfg);
+                    }
+                    ui.label(egui::RichText::new("(0 = off)").weak().small());
+                });
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Mixed port authentication").strong());
+                let mut enabled = self.cfg.auth.is_some();
+                if ui
+                    .checkbox(&mut enabled, "require credentials (SOCKS5 user/pass + HTTP Basic)")
+                    .changed()
+                {
+                    self.cfg.auth = if enabled {
+                        Some(Auth {
+                            user: "kubevpn".to_string(),
+                            pass: String::new(),
+                        })
+                    } else {
+                        None
+                    };
+                    config::save(&self.cfg);
+                    self.refresh_routes();
+                    self.status = if enabled {
+                        "auth enabled: set a password and update every client (kubectl, browsers, DSH)".into()
+                    } else {
+                        "auth disabled".into()
+                    };
+                }
+                let mut auth_changed = false;
+                if let Some(a) = &mut self.cfg.auth {
+                    ui.horizontal(|ui| {
+                        ui.label("user:");
+                        auth_changed |= ui
+                            .add(egui::TextEdit::singleline(&mut a.user).desired_width(140.0))
+                            .changed();
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("password:");
+                        auth_changed |= ui
+                            .add(
+                                egui::TextEdit::singleline(&mut a.pass)
+                                    .password(true)
+                                    .desired_width(140.0),
+                            )
+                            .changed();
+                    });
+                    if a.pass.is_empty() {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(230, 170, 90),
+                            "password is empty - set one before relying on auth",
+                        );
+                    }
+                }
+                if auth_changed {
+                    config::save(&self.cfg);
+                    self.refresh_routes();
+                }
             });
     }
 
@@ -678,6 +890,30 @@ impl App {
     fn install_engine(&mut self, key: &str) {
         self.status = format!("downloading {} in the background...", key);
         self.tasks.install(key.to_string(), self.logs.clone());
+    }
+
+    /// Installing over an already configured binary replaces it with the VANILLA
+    /// release - a custom build (e.g. Happ's xray with finalmask) would stop being
+    /// used. Require an explicit second click before doing that.
+    fn request_install(&mut self, key: &str) {
+        let current = match key {
+            "awg" => self.cfg.binaries.awg.clone(),
+            "xray" => self.cfg.binaries.xray.clone(),
+            _ => self.cfg.binaries.singbox.clone(),
+        };
+        if !current.trim().is_empty()
+            && std::path::Path::new(&current).exists()
+            && self.confirm_install.as_deref() != Some(key)
+        {
+            self.confirm_install = Some(key.to_string());
+            self.status = format!(
+                "{} is already configured ({}). Install replaces it with the vanilla release - custom builds will no longer be used. Click install again to confirm.",
+                key, current
+            );
+            return;
+        }
+        self.confirm_install = None;
+        self.install_engine(key);
     }
 
     fn bin_for(&self, kind: &str) -> String {
@@ -718,12 +954,20 @@ impl App {
             .as_deref()
             .filter(|id| self.children.contains_key(*id))
             .and_then(|id| self.port_of(id));
-        Routes {
+        let auth = self
+            .cfg
+            .auth
+            .as_ref()
+            .filter(|a| !a.user.is_empty())
+            .map(|a| (a.user.clone(), a.pass.clone()));
+        Routes::build(
             rules,
             default,
             default_configured,
-            fail_closed: self.cfg.fail_closed,
-        }
+            self.cfg.fail_closed,
+            auth,
+            self.cfg.log_requests,
+        )
     }
 
     fn refresh_routes(&self) {
@@ -765,7 +1009,35 @@ impl App {
             let _ = child.wait();
             log(&self.logs, format!("{} stopped", id));
         }
+        self.health.remove(id);
+        self.probe_pending.remove(id);
         self.refresh_routes();
+    }
+
+    /// Exponential backoff: 5s, 10s, 20s ... capped at 5 min; after 8 consecutive
+    /// failures stop trying and surface a crash-loop status instead of spinning forever.
+    fn schedule_restart(&mut self, id: &str) {
+        let attempts = self.restart_attempts.entry(id.to_string()).or_insert(0);
+        if *attempts >= 8 {
+            let msg = "crash loop: 8 attempts failed, fix the config and press restart".to_string();
+            self.profile_status.insert(id.to_string(), msg.clone());
+            log(&self.logs, format!("{}: {}", id, msg));
+            self.status = format!("{}: {}", id, msg);
+            return;
+        }
+        let delay = Duration::from_secs((5u64 << (*attempts).min(6)).min(300));
+        *attempts += 1;
+        self.restart_at
+            .insert(id.to_string(), Instant::now() + delay);
+        log(
+            &self.logs,
+            format!(
+                "restarting {} in {}s (attempt {})",
+                id,
+                delay.as_secs(),
+                *attempts
+            ),
+        );
     }
 
     fn check_children(&mut self) {
@@ -777,12 +1049,12 @@ impl App {
         }
         for (id, status) in dead {
             self.children.remove(&id);
+            self.health.remove(&id);
             self.profile_status
                 .insert(id.clone(), format!("exited ({})", status));
             log(&self.logs, format!("profile {} exited: {}", id, status));
             if self.running {
-                self.restart_at
-                    .insert(id, Instant::now() + Duration::from_secs(5));
+                self.schedule_restart(&id);
             }
         }
         if self.running {
@@ -805,11 +1077,29 @@ impl App {
         }
     }
 
+    fn start_probes(&mut self) {
+        let targets: Vec<(String, u16, Option<String>)> = self
+            .cfg
+            .profiles
+            .iter()
+            .filter(|p| self.children.contains_key(&p.id) && !self.probe_pending.contains(&p.id))
+            .map(|p| (p.id.clone(), p.port, probe_target(p)))
+            .collect();
+        for (id, port, target) in targets {
+            self.probe_pending.insert(id.clone());
+            self.tasks.probe(id, port, target);
+        }
+    }
+
     fn start(&mut self) {
         app_log("start() called");
         engines::kill_stale_sidecars(&self.logs);
         self.stop = Arc::new(AtomicBool::new(false));
         self.alive = Arc::new(AtomicBool::new(true));
+        self.health.clear();
+        self.probe_pending.clear();
+        self.restart_attempts.clear();
+        self.restart_at.clear();
         let profiles: Vec<Profile> = self
             .cfg
             .profiles
@@ -833,6 +1123,8 @@ impl App {
         }
         self.refresh_routes();
         self.start_listener();
+        // First health probe ~5s after start, then every 30s.
+        self.last_probe = Instant::now() - Duration::from_secs(25);
     }
 
     fn start_listener(&mut self) {
@@ -872,6 +1164,14 @@ impl App {
                     self.start_listener();
                 }
                 self.status = format!("listening on {}", addr);
+                if let Ok(sa) = addr.parse::<std::net::SocketAddr>() {
+                    if !sa.ip().is_loopback() {
+                        self.status = format!(
+                            "listening on {} - reachable from the network! Enable auth in Settings",
+                            addr
+                        );
+                    }
+                }
             }
             None => {
                 self.status = "invalid listen address, expected host:port or a port number".into()
@@ -889,10 +1189,43 @@ impl App {
         self.children.clear();
         self.profile_status.clear();
         self.restart_at.clear();
+        self.restart_attempts.clear();
+        self.health.clear();
+        self.probe_pending.clear();
         engines::clear_pid_file();
+        engines::clean_profile_configs();
         self.running = false;
         config::save(&self.cfg);
     }
+}
+
+/// One engine row in Settings; returns (install clicked, cancel clicked).
+/// A free function so the path borrow and the app borrow do not overlap.
+fn engine_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    path: &mut String,
+    confirm_armed: bool,
+) -> (bool, bool) {
+    let mut install = false;
+    let mut cancel = false;
+    ui.horizontal(|ui| {
+        ui.label(label);
+        ui.add(egui::TextEdit::singleline(path).desired_width(220.0));
+        if ui.small_button("install").clicked() {
+            install = true;
+        }
+    });
+    if confirm_armed {
+        ui.colored_label(
+            egui::Color32::from_rgb(230, 170, 90),
+            "will replace the configured binary with the vanilla release - click install again to confirm",
+        );
+        if ui.small_button("cancel").clicked() {
+            cancel = true;
+        }
+    }
+    (install, cancel)
 }
 
 /// Hide/show the window through the platform API.
@@ -981,6 +1314,7 @@ impl Drop for App {
         for child in self.children.values_mut() {
             let _ = child.kill();
         }
+        engines::clean_profile_configs();
     }
 }
 
@@ -989,7 +1323,9 @@ impl eframe::App for App {
         if self.running && !self.alive.load(Ordering::SeqCst) {
             self.running = false;
         }
-        ctx.request_repaint_after(Duration::from_millis(300));
+        // Slow tick for timers (health checks, probes, subscription refresh, uptime).
+        // Everything event-driven additionally wakes the loop via request_repaint().
+        ctx.request_repaint_after(Duration::from_secs(1));
 
         while let Some(res) = self.tasks.try_recv() {
             match res {
@@ -998,6 +1334,9 @@ impl eframe::App for App {
                     Err(e) => {
                         self.profile_status.insert(id.clone(), e.clone());
                         log(&self.logs, format!("profile {} failed: {}", id, e));
+                        if self.running {
+                            self.schedule_restart(&id);
+                        }
                     }
                 },
                 TaskResult::Refreshed { id, result } => {
@@ -1030,6 +1369,51 @@ impl eframe::App for App {
                         self.status = format!("install {} failed: {}", key, e);
                     }
                 },
+                TaskResult::Probed { id, result } => {
+                    self.probe_pending.remove(&id);
+                    if self.children.contains_key(&id) {
+                        match result {
+                            Ok(ms) => {
+                                self.health.insert(
+                                    id.clone(),
+                                    Health {
+                                        ok: true,
+                                        latency_ms: ms,
+                                        fails: 0,
+                                    },
+                                );
+                                // A healthy tunnel resets the crash-loop counter.
+                                self.restart_attempts.remove(&id);
+                            }
+                            Err(e) => {
+                                let fails = self.health.get(&id).map(|h| h.fails).unwrap_or(0) + 1;
+                                self.health.insert(
+                                    id.clone(),
+                                    Health {
+                                        ok: false,
+                                        latency_ms: 0,
+                                        fails,
+                                    },
+                                );
+                                log(
+                                    &self.logs,
+                                    format!("probe {} failed ({}): {}", id, fails, e),
+                                );
+                                if fails >= 3 && self.running {
+                                    log(
+                                        &self.logs,
+                                        format!(
+                                            "{}: 3 consecutive probe failures, restarting the sidecar",
+                                            id
+                                        ),
+                                    );
+                                    self.stop_by_id(&id);
+                                    self.schedule_restart(&id);
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -1090,6 +1474,16 @@ impl eframe::App for App {
             self.check_children();
         }
 
+        if self.running && self.last_probe.elapsed() > Duration::from_secs(30) {
+            self.last_probe = Instant::now();
+            self.start_probes();
+        }
+
+        if self.last_sub_check.elapsed() > Duration::from_secs(60) {
+            self.last_sub_check = Instant::now();
+            self.refresh_due_subscriptions();
+        }
+
         if !ctx.input(|i| i.raw.dropped_files.is_empty()) {
             let files: Vec<PathBuf> = ctx.input(|i| {
                 i.raw
@@ -1133,6 +1527,55 @@ impl eframe::App for App {
                         name, fallback
                     ));
                 }
+            }
+            if let Ok(sa) = self.cfg.listen.parse::<std::net::SocketAddr>() {
+                if !sa.ip().is_loopback() {
+                    warnings.push(format!(
+                        "listening on {} is reachable from the network{}",
+                        self.cfg.listen,
+                        if self.cfg.auth.is_some() {
+                            ""
+                        } else {
+                            " WITHOUT authentication - enable auth in Settings"
+                        }
+                    ));
+                }
+            }
+        }
+
+        // Tray icon reflects the state: gray stopped, green healthy, red degraded.
+        let degraded = self.running
+            && (self
+                .cfg
+                .rules
+                .iter()
+                .any(|r| !self.children.contains_key(&r.profile))
+                || self
+                    .cfg
+                    .default_profile
+                    .as_ref()
+                    .is_some_and(|d| !self.children.contains_key(d))
+                || self.health.values().any(|h| !h.ok));
+        let state = (self.running, degraded);
+        if self.tray_state != Some(state) {
+            self.tray_state = Some(state);
+            if let Some(t) = &self.tray {
+                let color = if !self.running {
+                    [120, 120, 120]
+                } else if degraded {
+                    [220, 90, 70]
+                } else {
+                    [70, 180, 120]
+                };
+                let tooltip = format!(
+                    "kubevpn - {}\nconns {}  active {}  up {}  down {}",
+                    if self.running { "listening" } else { "stopped" },
+                    self.stats.conns.load(Ordering::Relaxed),
+                    self.stats.active.load(Ordering::Relaxed),
+                    human(self.stats.in_bytes.load(Ordering::Relaxed)),
+                    human(self.stats.out_bytes.load(Ordering::Relaxed)),
+                );
+                t.set_state(color, &tooltip);
             }
         }
 
@@ -1347,6 +1790,8 @@ impl eframe::App for App {
                         let mut remove: Option<String> = None;
                         let mut restart: Option<String> = None;
                         let mut toggle: Option<(String, bool)> = None;
+                        let mut test: Option<String> = None;
+                        let mut view_log: Option<String> = None;
 
                         for (key, idxs) in groups {
                             let header = match &key {
@@ -1378,6 +1823,12 @@ impl eframe::App for App {
                                 };
                                 let mut on = self.cfg.profiles[idx].enabled;
                                 let running = self.children.contains_key(&id);
+                                let health = self.health.get(&id).map(|h| (h.ok, h.latency_ms));
+                                let pstats = if running {
+                                    Some(self.stats.port_snapshot(port))
+                                } else {
+                                    None
+                                };
                                 ui.horizontal(|ui| {
                                     if ui.checkbox(&mut on, "").changed() {
                                         toggle = Some((id.clone(), on));
@@ -1398,6 +1849,31 @@ impl eframe::App for App {
                                             .weak()
                                             .small(),
                                     );
+                                    if let Some((ok, ms)) = health {
+                                        if ok {
+                                            ui.label(
+                                                egui::RichText::new(format!("{} ms", ms))
+                                                    .weak()
+                                                    .small(),
+                                            );
+                                        } else {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(230, 120, 120),
+                                                egui::RichText::new("probe failed").small(),
+                                            );
+                                        }
+                                    }
+                                    if let Some(ps) = pstats {
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "↑{} ↓{}",
+                                                human(ps.in_bytes),
+                                                human(ps.out_bytes)
+                                            ))
+                                            .weak()
+                                            .small(),
+                                        );
+                                    }
                                     if !running {
                                         if let Some(st) = self.profile_status.get(&id) {
                                             let short: String = st.chars().take(50).collect();
@@ -1417,6 +1893,12 @@ impl eframe::App for App {
                                             if ui.small_button("restart").clicked() {
                                                 restart = Some(id.clone());
                                             }
+                                            if ui.small_button("log").clicked() {
+                                                view_log = Some(id.clone());
+                                            }
+                                            if running && ui.small_button("test").clicked() {
+                                                test = Some(id.clone());
+                                            }
                                         },
                                     );
                                 });
@@ -1425,6 +1907,7 @@ impl eframe::App for App {
 
                         if let Some(id) = restart {
                             if self.running {
+                                self.restart_attempts.remove(&id);
                                 self.stop_by_id(&id);
                                 self.spawn_by_id(&id);
                             } else {
@@ -1432,6 +1915,9 @@ impl eframe::App for App {
                             }
                         }
                         if let Some((id, enabled)) = toggle {
+                            if let Some(p) = self.cfg.profiles.iter_mut().find(|p| p.id == id) {
+                                p.enabled = enabled;
+                            }
                             config::save(&self.cfg);
                             if self.running {
                                 if enabled {
@@ -1440,6 +1926,32 @@ impl eframe::App for App {
                                     self.stop_by_id(&id);
                                 }
                             }
+                        }
+                        if let Some(id) = test {
+                            if self.running
+                                && self.children.contains_key(&id)
+                                && !self.probe_pending.contains(&id)
+                            {
+                                let target =
+                                    self.profile_by_id(&id).map(|p| (p.port, probe_target(p)));
+                                if let Some((port, target)) = target {
+                                    self.probe_pending.insert(id.clone());
+                                    self.tasks.probe(id, port, target);
+                                    self.status = "probing...".into();
+                                }
+                            } else {
+                                self.status =
+                                    "profile is not running or a probe is in flight".into();
+                            }
+                        }
+                        if let Some(id) = view_log {
+                            let kind = self
+                                .profile_by_id(&id)
+                                .map(|p| p.kind.clone())
+                                .unwrap_or_default();
+                            self.log_view_text = read_sidecar_log(&id, &kind);
+                            self.log_view_at = Instant::now();
+                            self.log_view = Some(id);
                         }
                         if let Some(id) = remove {
                             self.stop_by_id(&id);
@@ -1451,6 +1963,8 @@ impl eframe::App for App {
                             if self.cfg.default_profile.as_deref() == Some(id.as_str()) {
                                 self.cfg.default_profile = None;
                             }
+                            self.restart_at.remove(&id);
+                            self.restart_attempts.remove(&id);
                             config::save(&self.cfg);
                             self.refresh_routes();
                         }
@@ -1467,16 +1981,43 @@ impl eframe::App for App {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(6.0);
-            ui.heading("Log");
-            ui.add_space(4.0);
-            let logs = self.logs.lock().map(|l| l.clone()).unwrap_or_default();
-            egui::ScrollArea::vertical()
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    for line in logs.iter() {
-                        ui.label(egui::RichText::new(line).monospace().size(12.0));
+            if let Some(id) = self.log_view.clone() {
+                ui.horizontal(|ui| {
+                    ui.heading(format!("Sidecar log: {}", id));
+                    if ui.button("back to app log").clicked() {
+                        self.log_view = None;
                     }
                 });
+                ui.add_space(4.0);
+                if self.log_view_at.elapsed() > Duration::from_secs(1) {
+                    self.log_view_at = Instant::now();
+                    let kind = self
+                        .profile_by_id(&id)
+                        .map(|p| p.kind.clone())
+                        .unwrap_or_default();
+                    self.log_view_text = read_sidecar_log(&id, &kind);
+                }
+                egui::ScrollArea::vertical()
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(&self.log_view_text)
+                                .monospace()
+                                .size(12.0),
+                        );
+                    });
+            } else {
+                ui.heading("Log");
+                ui.add_space(4.0);
+                let logs = self.logs.lock().map(|l| l.clone()).unwrap_or_default();
+                egui::ScrollArea::vertical()
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for line in logs.iter() {
+                            ui.label(egui::RichText::new(line).monospace().size(12.0));
+                        }
+                    });
+            }
         });
     }
 }

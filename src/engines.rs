@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Result};
 
 use crate::config::Profile;
-use crate::util::{app_log, hide_console, log, strip_ansi, Logs};
+use crate::util::{app_log, hide_console, log, now_secs, strip_ansi, Logs};
 
 pub fn profile_dir() -> PathBuf {
     std::env::temp_dir().join("kubevpn-profiles")
@@ -73,18 +73,39 @@ pub fn write_profile_file(p: &Profile) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Remove generated engine configs (they contain private keys) but keep sidecar logs
+/// for post-mortem. Called on stop and on app exit.
+pub fn clean_profile_configs() {
+    let dir = profile_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.extension()
+            .map(|x| x == "conf" || x == "json")
+            .unwrap_or(false)
+        {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+}
+
 fn pids_file() -> PathBuf {
     std::env::temp_dir().join("kubevpn-sidecars.txt")
 }
 
-pub fn record_pid(name: &str, pid: u32) {
+/// Record "name pid spawn_unix". The spawn timestamp guards against PID reuse:
+/// a recycled PID belonging to an unrelated process (e.g. another app's xray)
+/// will have a different start time and is never killed.
+pub fn record_pid(name: &str, pid: u32, spawned_at: u64) {
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(pids_file())
     {
-        let _ = writeln!(f, "{} {}", name, pid);
+        let _ = writeln!(f, "{} {} {}", name, pid, spawned_at);
     }
 }
 
@@ -99,16 +120,19 @@ pub fn kill_stale_sidecars(logs: &Logs) {
             let mut it = line.split_whitespace();
             let _name = it.next().unwrap_or("");
             let pid = it.next().and_then(|s| s.parse::<u32>().ok());
-            if let Some(pid) = pid {
-                if let Some(proc_) = sys.process(sysinfo::Pid::from_u32(pid)) {
-                    let pname = proc_.name().to_string_lossy().to_lowercase();
-                    if pname.contains("wireproxy")
-                        || pname.contains("xray")
-                        || pname.contains("sing-box")
-                    {
-                        proc_.kill();
-                        killed += 1;
-                    }
+            let spawned = it.next().and_then(|s| s.parse::<u64>().ok());
+            let (Some(pid), Some(spawned)) = (pid, spawned) else {
+                continue; // legacy two-field entries cannot be verified safely
+            };
+            if let Some(proc_) = sys.process(sysinfo::Pid::from_u32(pid)) {
+                let pname = proc_.name().to_string_lossy().to_lowercase();
+                let is_sidecar = pname.contains("wireproxy")
+                    || pname.contains("xray")
+                    || pname.contains("sing-box");
+                let start_ok = proc_.start_time().abs_diff(spawned) <= 5;
+                if is_sidecar && start_ok {
+                    proc_.kill();
+                    killed += 1;
                 }
             }
         }
@@ -121,6 +145,62 @@ pub fn kill_stale_sidecars(logs: &Logs) {
 
 pub fn clear_pid_file() {
     let _ = std::fs::remove_file(pids_file());
+}
+
+/// Windows job object with KILL_ON_JOB_CLOSE: when kubevpn exits for any reason
+/// (including a crash or Task Manager kill), the OS closes the job handle and every
+/// assigned sidecar is terminated automatically. The handle lives for the whole
+/// process lifetime in a OnceLock and is never closed explicitly.
+#[cfg(windows)]
+mod job {
+    use std::sync::OnceLock;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    static JOB: OnceLock<isize> = OnceLock::new();
+
+    fn handle() -> Option<isize> {
+        let h = *JOB.get_or_init(|| unsafe {
+            let h = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if h.is_null() {
+                return 0;
+            }
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let ok = SetInformationJobObject(
+                h,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const std::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            if ok == 0 {
+                return 0;
+            }
+            h as isize
+        });
+        if h == 0 {
+            None
+        } else {
+            Some(h)
+        }
+    }
+
+    pub fn assign(child: &std::process::Child) {
+        use std::os::windows::io::AsRawHandle;
+        if let Some(h) = handle() {
+            unsafe {
+                AssignProcessToJobObject(h as *mut std::ffi::c_void, child.as_raw_handle());
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod job {
+    pub fn assign(_child: &std::process::Child) {}
 }
 
 pub fn wait_port(port: u16, timeout: Duration) -> bool {
@@ -162,11 +242,12 @@ pub fn spawn(p: &Profile, bin: &str, logs: &Logs) -> Result<Child> {
     hide_console(&mut cmd);
 
     let mut child = cmd.spawn()?;
+    job::assign(&child);
     let bin_name = Path::new(bin)
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
-    record_pid(&bin_name, child.id());
+    record_pid(&bin_name, child.id(), now_secs());
 
     if wait_port(p.port, Duration::from_secs(10)) {
         log(logs, format!("{} ({}:{}) up", p.name, p.kind, p.port));
