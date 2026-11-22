@@ -1253,9 +1253,9 @@ mod window_ctl {
     use windows_sys::Win32::Foundation::RECT;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GetWindowLongPtrW, GetWindowPlacement, GetWindowRect,
-        GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, SetForegroundWindow,
-        SetWindowLongPtrW, SetWindowPlacement, SetWindowPos, ShowWindow, GWL_EXSTYLE,
-        SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER, SW_MINIMIZE, SW_RESTORE, WINDOWPLACEMENT,
+        GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, SetWindowLongPtrW,
+        SetWindowPlacement, SetWindowPos, ShowWindow, GWL_EXSTYLE, SWP_FRAMECHANGED,
+        SWP_NOACTIVATE, SWP_NOZORDER, SW_MINIMIZE, SW_RESTORE, WINDOWPLACEMENT,
     };
 
     use crate::util::app_log;
@@ -1451,7 +1451,10 @@ mod window_ctl {
                     ShowWindow(h, SW_RESTORE);
                     app_log("window_ctl show: no saved placement, SW_RESTORE");
                 }
-                SetForegroundWindow(h);
+                // Deliberately no SetForegroundWindow: it sends messages to the
+                // current foreground window and hangs forever if that app is hung
+                // (a suspended SystemSettings CoreWindow froze the UI thread this
+                // way). SetWindowPlacement/ShowWindow already activate our window.
             }
         } else {
             app_log("window_ctl show: window not found");
@@ -1624,9 +1627,11 @@ impl eframe::App for App {
                     app_log("tray: show window");
                     self.hidden = false;
                     window_ctl::show();
-                    // No ViewportCommand::Visible here: winit's visibility flag machinery
-                    // can re-show the window with a stale size; Win32 above owns the show.
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    // No ViewportCommand::Visible/Focus here: winit's visibility flag
+                    // machinery can re-show the window with a stale size, and its focus
+                    // path calls SetForegroundWindow, which blocks forever when the
+                    // current foreground window belongs to a hung app. Win32 above owns
+                    // the show; SetWindowPlacement's showCmd activates the window.
                     // Re-pin the geometry shortly after: some winit/egui event processed
                     // after this frame can still re-show the minimized strip.
                     self.repin_at = Some(Instant::now() + Duration::from_millis(600));

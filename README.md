@@ -36,13 +36,17 @@ client (browser, kubectl, curl)
   pointed at it too. SOCKS4 is deliberately not supported (it resolves DNS on the client).
 - The listening address is editable in the window: changing it restarts only the listener, tunnels keep
   running. It can also be overridden at launch with `--listen`.
-- Tray icon with a menu (show window / start / stop / quit). Closing the window hides it to the tray
-  instead of quitting; disable that with `minimize_to_tray: false`. The icon reflects the state:
+- Tray icon, Discord/Steam/Telegram style: left click (or double click) opens the window,
+  right click opens the menu (show window / start / stop / quit). `Win+Shift+K` is a global hotkey
+  that restores the window from anywhere. Closing the window hides it to the tray instead of
+  quitting; disable that with `minimize_to_tray: false`. The icon reflects the state:
   gray stopped, green running, red when a route target is down or a probe fails; the tooltip shows
-  live counters.
+  live counters. On Windows the tray icon and its menu live on a dedicated thread, so the modal
+  menu loop can never block the UI.
 - `launch at login` checkbox (HKCU Run key on Windows, LaunchAgent on macOS, autostart entry on Linux).
 - Everything slow runs in the background: engine downloads, sidecar starts and health probes never
-  block the UI, and every background result wakes the UI loop directly (no busy repaint timer).
+  block the UI; background results wake the UI loop directly, plus a light periodic wake keeps a
+  minimized window's loop processing tray events and timers.
 - Per-profile status in the list, `restart`, `test` and `log` buttons, and automatic restart with
   exponential backoff (5s → 10s → … → 5 min) after a sidecar exits unexpectedly; after 8 consecutive
   failures the profile is marked as a crash loop instead of spinning forever.
@@ -199,8 +203,16 @@ Environment variables, useful for scripted setup:
 
 ## Tray
 
-The window can be closed to the tray; the tunnels keep running. The tray menu has *Show window*,
-*Start tunnels*, *Stop tunnels* and *Quit*. A double click on the icon shows the window.
+The window can be closed to the tray; the tunnels keep running. Left click or double click on the
+icon opens the window; right click opens the menu (*Show window*, *Start tunnels*, *Stop tunnels*,
+*Quit*). The global hotkey `Win+Shift+K` also restores the window (Windows only).
+
+On Windows the tray icon is created on a dedicated thread with its own message pump: the modal
+`TrackPopupMenu` loop blocks that thread only, never the egui UI thread. Window show/hide never
+calls `FindWindowW` or `SetForegroundWindow`: both send messages to other processes' windows and
+block forever when any of them is hung (a suspended SystemSettings window froze the UI this way).
+The main window handle is resolved via `EnumWindows` (own pid + geometry, no messages sent) and
+cached; activation is done by `SetWindowPlacement`/`ShowWindow` on our own window only.
 
 On Windows the window is minimized and its taskbar button is removed (`WS_EX_TOOLWINDOW`) rather than
 hidden with `ShowWindow(SW_HIDE)`. A truly hidden window stops receiving redraws, the egui update loop
