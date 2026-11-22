@@ -96,6 +96,7 @@ pub struct App {
     last_health_check: Instant,
     hidden: bool,
     test_did_hide: bool,
+    test_did_show: bool,
     autostart_login: bool,
     quitting: bool,
     routes: Arc<RwLock<Routes>>,
@@ -157,6 +158,7 @@ impl App {
             last_health_check: Instant::now(),
             hidden: false,
             test_did_hide: false,
+            test_did_show: false,
             autostart_login: autostart_state(),
             quitting: false,
             routes: Arc::new(RwLock::new(Routes::default())),
@@ -1347,6 +1349,39 @@ mod window_ctl {
         }
     }
 
+    /// Diagnostic watchdog: sample the window rect for 6s after a show and log
+    /// every change, so whatever clobbers the geometry is caught with a timestamp.
+    pub fn watch(title: &str) {
+        let Some(h) = find(title) else {
+            return;
+        };
+        let h = h as isize;
+        std::thread::spawn(move || {
+            let h = h as *mut std::ffi::c_void;
+            let mut prev = String::new();
+            for i in 0..30 {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                unsafe {
+                    let mut r: windows_sys::Win32::Foundation::RECT = std::mem::zeroed();
+                    windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(h, &mut r);
+                    let iconic = IsIconic(h);
+                    let cur = format!(
+                        "({},{}) {}x{} iconic={}",
+                        r.left,
+                        r.top,
+                        r.right - r.left,
+                        r.bottom - r.top,
+                        iconic
+                    );
+                    if cur != prev {
+                        app_log(&format!("watch +{}ms: {}", i * 200, cur));
+                        prev = cur;
+                    }
+                }
+            }
+        });
+    }
+
     pub fn show(title: &str) {
         if let Some(h) = find(title) {
             unsafe {
@@ -1395,6 +1430,7 @@ mod window_ctl {
     pub fn hide(_title: &str) {}
     pub fn show(_title: &str) {}
     pub fn repin(_title: &str) {}
+    pub fn watch(_title: &str) {}
 }
 
 fn autostart_builder() -> Option<auto_launch::AutoLaunch> {
@@ -1544,6 +1580,7 @@ impl eframe::App for App {
                     // Re-pin the geometry shortly after: some winit/egui event processed
                     // after this frame can still re-show the minimized strip.
                     self.repin_at = Some(Instant::now() + Duration::from_millis(600));
+                    window_ctl::watch("kubevpn");
                 }
                 TrayAction::Start => {
                     if !self.running {
@@ -1580,7 +1617,14 @@ impl eframe::App for App {
                 self.hidden = true;
                 window_ctl::hide("kubevpn");
                 app_log("selftest: window hidden");
-            } else if self.test_did_hide && self.hidden && elapsed > Duration::from_secs(12) {
+            } else if self.test_did_hide
+                && !self.test_did_show
+                && self.hidden
+                && elapsed > Duration::from_secs(12)
+            {
+                // One-shot: without test_did_show this branch would undo EVERY later
+                // hide (tray close included) for the whole process lifetime.
+                self.test_did_show = true;
                 self.hidden = false;
                 window_ctl::show("kubevpn");
                 app_log("selftest: window shown");
