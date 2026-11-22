@@ -1250,8 +1250,10 @@ fn engine_row(
 #[cfg(windows)]
 mod window_ctl {
     use std::sync::Mutex;
+    use windows_sys::Win32::Foundation::RECT;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        FindWindowW, GetWindowLongPtrW, GetWindowPlacement, IsIconic, SetForegroundWindow,
+        EnumWindows, GetWindowLongPtrW, GetWindowPlacement, GetWindowRect,
+        GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, SetForegroundWindow,
         SetWindowLongPtrW, SetWindowPlacement, SetWindowPos, ShowWindow, GWL_EXSTYLE,
         SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOZORDER, SW_MINIMIZE, SW_RESTORE, WINDOWPLACEMENT,
     };
@@ -1267,14 +1269,44 @@ mod window_ctl {
     /// Restoring the saved WINDOWPLACEMENT explicitly pins the original geometry.
     static SAVED_PLACEMENT: Mutex<Option<WINDOWPLACEMENT>> = Mutex::new(None);
 
-    fn find(title: &str) -> Option<*mut std::ffi::c_void> {
-        let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
-        let handle = unsafe { FindWindowW(std::ptr::null(), wide.as_ptr()) };
-        if handle.is_null() {
-            None
-        } else {
-            Some(handle)
+    static MAIN_HWND: Mutex<Option<isize>> = Mutex::new(None);
+
+    /// Resolve our own main window WITHOUT sending messages to any window.
+    /// FindWindowW broadcasts WM_GETTEXT to every top-level window and blocks
+    /// forever on hung apps (a suspended SystemSettings CoreWindow did exactly
+    /// that, freezing the UI thread inside hide/show and killing tray delivery).
+    /// EnumWindows + pid + geometry never sends messages, so it cannot hang.
+    fn hwnd() -> Option<*mut std::ffi::c_void> {
+        let mut cached = MAIN_HWND.lock().unwrap();
+        if let Some(h) = *cached {
+            let h = h as *mut std::ffi::c_void;
+            if unsafe { IsWindow(h) } != 0 {
+                return Some(h);
+            }
+            *cached = None;
         }
+        unsafe extern "system" fn cb(h: *mut std::ffi::c_void, l: isize) -> i32 {
+            let mut wpid: u32 = 0;
+            GetWindowThreadProcessId(h, &mut wpid);
+            if wpid == std::process::id() && IsWindowVisible(h) != 0 {
+                let mut r: RECT = std::mem::zeroed();
+                GetWindowRect(h, &mut r);
+                if r.right - r.left > 200 && r.bottom - r.top > 200 {
+                    *(l as *mut isize) = h as isize;
+                    return 0;
+                }
+            }
+            1
+        }
+        let mut found: isize = 0;
+        unsafe {
+            EnumWindows(Some(cb), &mut found as *mut isize as isize);
+        }
+        if found == 0 {
+            return None;
+        }
+        *cached = Some(found);
+        Some(found as *mut std::ffi::c_void)
     }
 
     fn placement(h: *mut std::ffi::c_void) -> Option<WINDOWPLACEMENT> {
@@ -1306,8 +1338,8 @@ mod window_ctl {
 
     /// Minimize and drop the taskbar button. The window keeps its event loop, so the tray stays
     /// responsive; hiding it outright would stop redraws and freeze the UI.
-    pub fn hide(title: &str) {
-        if let Some(h) = find(title) {
+    pub fn hide() {
+        if let Some(h) = hwnd() {
             unsafe {
                 if let Some(wp) = placement(h) {
                     log_placement("hide captured", h, &wp);
@@ -1324,12 +1356,12 @@ mod window_ctl {
 
     /// Restore the saved outer rect with SetWindowPos; used right after show and
     /// again a moment later in case something re-shows the minimized strip.
-    pub fn repin(title: &str) {
+    pub fn repin() {
         let saved = *SAVED_PLACEMENT.lock().unwrap();
         let Some(wp) = saved else {
             return;
         };
-        if let Some(h) = find(title) {
+        if let Some(h) = hwnd() {
             unsafe {
                 if IsIconic(h) != 0 {
                     ShowWindow(h, SW_RESTORE);
@@ -1353,8 +1385,8 @@ mod window_ctl {
 
     /// Diagnostic watchdog: sample the window rect for 6s after a show and log
     /// every change, so whatever clobbers the geometry is caught with a timestamp.
-    pub fn watch(title: &str) {
-        let Some(h) = find(title) else {
+    pub fn watch() {
+        let Some(h) = hwnd() else {
             return;
         };
         let h = h as isize;
@@ -1384,8 +1416,8 @@ mod window_ctl {
         });
     }
 
-    pub fn show(title: &str) {
-        if let Some(h) = find(title) {
+    pub fn show() {
+        if let Some(h) = hwnd() {
             unsafe {
                 let ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
                 SetWindowLongPtrW(h, GWL_EXSTYLE, ex & !WS_EX_TOOLWINDOW);
@@ -1429,10 +1461,10 @@ mod window_ctl {
 
 #[cfg(not(windows))]
 mod window_ctl {
-    pub fn hide(_title: &str) {}
-    pub fn show(_title: &str) {}
-    pub fn repin(_title: &str) {}
-    pub fn watch(_title: &str) {}
+    pub fn hide() {}
+    pub fn show() {}
+    pub fn repin() {}
+    pub fn watch() {}
 }
 
 fn autostart_builder() -> Option<auto_launch::AutoLaunch> {
@@ -1591,14 +1623,14 @@ impl eframe::App for App {
                 TrayAction::Show => {
                     app_log("tray: show window");
                     self.hidden = false;
-                    window_ctl::show("kubevpn");
+                    window_ctl::show();
                     // No ViewportCommand::Visible here: winit's visibility flag machinery
                     // can re-show the window with a stale size; Win32 above owns the show.
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     // Re-pin the geometry shortly after: some winit/egui event processed
                     // after this frame can still re-show the minimized strip.
                     self.repin_at = Some(Instant::now() + Duration::from_millis(600));
-                    window_ctl::watch("kubevpn");
+                    window_ctl::watch();
                 }
                 TrayAction::Start => {
                     if !self.running {
@@ -1621,7 +1653,7 @@ impl eframe::App for App {
         {
             self.hidden = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            window_ctl::hide("kubevpn");
+            window_ctl::hide();
             app_log("window hidden to tray");
             ctx.request_repaint();
         }
@@ -1633,7 +1665,7 @@ impl eframe::App for App {
             if !self.test_did_hide && elapsed > Duration::from_secs(6) {
                 self.test_did_hide = true;
                 self.hidden = true;
-                window_ctl::hide("kubevpn");
+                window_ctl::hide();
                 app_log("selftest: window hidden");
             } else if self.test_did_hide
                 && !self.test_did_show
@@ -1644,7 +1676,7 @@ impl eframe::App for App {
                 // hide (tray close included) for the whole process lifetime.
                 self.test_did_show = true;
                 self.hidden = false;
-                window_ctl::show("kubevpn");
+                window_ctl::show();
                 app_log("selftest: window shown");
             }
         }
@@ -1652,7 +1684,7 @@ impl eframe::App for App {
         if let Some(t) = self.repin_at {
             if Instant::now() >= t {
                 self.repin_at = None;
-                window_ctl::repin("kubevpn");
+                window_ctl::repin();
             }
         }
 
