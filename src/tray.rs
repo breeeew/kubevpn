@@ -4,6 +4,74 @@ use anyhow::Result;
 use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
+/// Independent restore path: a global hotkey (Win+Shift+K) serviced by our own
+/// message-only window and thread. Tray menu delivery can break after the shell
+/// recreates the tray (upstream tray-icon/muda subclassing issue); this path does
+/// not depend on the tray, winit or the egui loop being redrawn.
+#[cfg(windows)]
+pub fn spawn_hotkey_listener(ctx: egui::Context, tx: Sender<TrayAction>) {
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, MOD_SHIFT, MOD_WIN};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, RegisterClassW,
+        TranslateMessage, HWND_MESSAGE, MSG, WM_HOTKEY, WNDCLASSW,
+    };
+    std::thread::spawn(move || unsafe {
+        let class_name: Vec<u16> = "kubevpn_hotkey_class"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let instance = GetModuleHandleW(std::ptr::null());
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(DefWindowProcW),
+            hInstance: instance,
+            lpszClassName: class_name.as_ptr(),
+            ..std::mem::zeroed()
+        };
+        if RegisterClassW(&wc) == 0 {
+            crate::util::app_log("hotkey: RegisterClassW failed");
+            return;
+        }
+        let hwnd = CreateWindowExW(
+            0,
+            class_name.as_ptr(),
+            std::ptr::null(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            HWND_MESSAGE,
+            std::ptr::null_mut(),
+            instance,
+            std::ptr::null(),
+        );
+        if hwnd.is_null() {
+            crate::util::app_log("hotkey: CreateWindowExW failed");
+            return;
+        }
+        // Win+Shift+K, id 1
+        if RegisterHotKey(hwnd, 1, MOD_WIN | MOD_SHIFT, 0x4B) == 0 {
+            crate::util::app_log("hotkey: RegisterHotKey failed");
+            return;
+        }
+        crate::util::app_log("hotkey: Win+Shift+K registered");
+        let mut msg: MSG = std::mem::zeroed();
+        while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+            if msg.message == WM_HOTKEY && msg.wParam == 1 {
+                crate::util::app_log("hotkey: Win+Shift+K pressed");
+                let _ = tx.send(TrayAction::Show);
+                ctx.request_repaint();
+            }
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    });
+}
+
+#[cfg(not(windows))]
+pub fn spawn_hotkey_listener(_ctx: egui::Context, _tx: Sender<TrayAction>) {}
+
 pub enum TrayAction {
     Show,
     Start,
@@ -59,6 +127,7 @@ impl Tray {
             .build()?;
 
         let (tx, rx) = channel::<TrayAction>();
+        spawn_hotkey_listener(ctx.clone(), tx.clone());
 
         let show_id = show.id().clone();
         let start_id = start.id().clone();
@@ -70,6 +139,7 @@ impl Tray {
             std::thread::spawn(move || {
                 let events = tray_icon::menu::MenuEvent::receiver();
                 while let Ok(event) = events.recv() {
+                    crate::util::app_log(&format!("tray-delivery: menu event {:?}", event.id));
                     let action = if event.id == show_id {
                         Some(TrayAction::Show)
                     } else if event.id == start_id {
@@ -94,6 +164,7 @@ impl Tray {
             std::thread::spawn(move || {
                 let events = tray_icon::TrayIconEvent::receiver();
                 while let Ok(event) = events.recv() {
+                    crate::util::app_log(&format!("tray-delivery: icon event {:?}", event));
                     match event {
                         tray_icon::TrayIconEvent::DoubleClick { .. }
                         | tray_icon::TrayIconEvent::Click { .. } => {

@@ -112,6 +112,7 @@ pub struct App {
     log_view_text: String,
     log_view_at: Instant,
     repin_at: Option<Instant>,
+    heartbeat_at: Instant,
     status: String,
 }
 
@@ -174,6 +175,7 @@ impl App {
             log_view_text: String::new(),
             log_view_at: Instant::now(),
             repin_at: None,
+            heartbeat_at: Instant::now(),
             status: String::new(),
         };
         // LOAD-BEARING on Windows: a minimized window stops honoring egui's internal
@@ -1477,6 +1479,16 @@ impl eframe::App for App {
         // Everything event-driven additionally wakes the loop via request_repaint().
         ctx.request_repaint_after(Duration::from_secs(1));
 
+        // Slow heartbeat: proves the update loop is alive (tray events, probes and
+        // auto-refresh all depend on it) and timestamps any future stall.
+        if self.heartbeat_at.elapsed() > Duration::from_secs(60) {
+            self.heartbeat_at = Instant::now();
+            app_log(&format!(
+                "ui heartbeat: hidden={} running={}",
+                self.hidden, self.running
+            ));
+        }
+
         while let Some(res) = self.tasks.try_recv() {
             match res {
                 TaskResult::Spawned { id, result } => match result {
@@ -1568,6 +1580,12 @@ impl eframe::App for App {
         }
 
         let actions = self.tray.as_ref().map(|t| t.poll()).unwrap_or_default();
+        if !actions.is_empty() {
+            app_log(&format!(
+                "tray-delivery: {} action(s) polled",
+                actions.len()
+            ));
+        }
         for action in actions {
             match action {
                 TrayAction::Show => {
